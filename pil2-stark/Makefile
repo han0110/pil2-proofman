@@ -1,8 +1,13 @@
 # Platform detection for compiler and library paths
 UNAME_S := $(shell uname -s)
 ifneq ($(UNAME_S),Darwin)
-    INFO := $(shell cd src/goldilocks && ./configure.sh && cd ../.. && sleep 2)
-    include src/goldilocks/CudaArch.mk
+    ifndef CUDA_ARCH
+        INFO := $(shell cd src/goldilocks && ./configure.sh && cd ../.. && sleep 2)
+        include src/goldilocks/CudaArch.mk
+        $(info CUDA_ARCH was not defined externally, using value from CudaArch.mk: $(CUDA_ARCH))
+    else
+        $(info CUDA_ARCH defined externally: $(CUDA_ARCH))
+    endif
 endif
 
 # CUDA detection - check multiple possible locations
@@ -78,7 +83,6 @@ ifeq ($(UNAME_S),Darwin)
     NVCC :=
 else ifeq ($(UNAME_S),Linux)
     CXX      = g++
-    include src/goldilocks/CudaArch.mk
     CPPFLAGS = -I/usr/include -I/usr/local/include -MMD -MP $(INC_FLAGS)
     CXXFLAGS = -std=c++17 -Wall -pthread -Wno-unused-label -fPIC -fopenmp
     LDFLAGS  = -rdynamic -fopenmp -lsodium -lpthread -lgmp -lstdc++
