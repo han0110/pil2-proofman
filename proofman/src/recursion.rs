@@ -160,8 +160,9 @@ pub fn gen_witness_aggregation<F: PrimeField64>(
     proof2: &Proof<F>,
     proof3: &Proof<F>,
     output_dir_path: &Path,
+    global_idx: usize,
 ) -> ProofmanResult<Proof<F>> {
-    timer_start_debug!(GENERATE_WITNESS_AGGREGATION);
+    timer_start_debug!(GENERATE_WITNESS_AGGREGATION, "GENERATE_WITNESS_AGGREGATION_{global_idx}");
     let proof_len = proof1.proof.len();
     if proof_len != proof2.proof.len() || proof_len != proof3.proof.len() {
         return Err(ProofmanError::ProofmanError(format!(
@@ -201,12 +202,12 @@ pub fn gen_witness_aggregation<F: PrimeField64>(
     add_publics_circom(&mut updated_proof_recursive2, 0, pctx, &recursive2_verkey, true);
     let circom_witness = generate_witness::<F>(setup_recursive2, 0, &updated_proof_recursive2, output_dir_path)?;
 
-    timer_stop_and_log_debug!(GENERATE_WITNESS_AGGREGATION);
+    timer_stop_and_log_debug!(GENERATE_WITNESS_AGGREGATION, "GENERATE_WITNESS_AGGREGATION_{global_idx}");
     Ok(Proof::new_witness(
         ProofType::Recursive2,
         airgroup_id,
         0,
-        None,
+        Some(global_idx),
         circom_witness,
         setup_recursive2.n_cols as usize,
     ))
@@ -484,9 +485,16 @@ pub fn aggregate_worker_proofs<F: PrimeField64>(
 
                         let proof3 = Proof::new(ProofType::Recursive2, airgroup, 0, None, proof_3);
 
-                        let mut circom_witness =
-                            gen_witness_aggregation::<F>(pctx, setups, &proof1, &proof2, &proof3, output_dir_path)?;
-                        circom_witness.global_idx = Some(rank);
+                        let circom_witness = gen_witness_aggregation::<F>(
+                            pctx,
+                            setups,
+                            &proof1,
+                            &proof2,
+                            &proof3,
+                            output_dir_path,
+                            rank,
+                        )?;
+                        // circom_witness.global_idx = Some(rank);
 
                         let recursive2_proof = gen_recursive_proof_size::<F>(pctx, setups, &circom_witness)?;
 

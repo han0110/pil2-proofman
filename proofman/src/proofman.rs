@@ -1619,6 +1619,13 @@ where
 
                         match recursive2_proof {
                             Some((p1, p2, p3)) => {
+                                let global_idx = {
+                                    let mut rec2_proofs = recursive2_proofs_ongoing_clone.write().unwrap();
+                                    let global_idx = rec2_proofs.len();
+                                    rec2_proofs.push(None);
+                                    global_idx
+                                };
+
                                 match gen_witness_aggregation(
                                     &pctx_clone,
                                     &setups_clone,
@@ -1626,6 +1633,7 @@ where
                                     &p2,
                                     &p3,
                                     &output_dir_path,
+                                    global_idx,
                                 ) {
                                     Ok(witness) => Some(witness),
                                     Err(e) => {
@@ -1818,16 +1826,16 @@ where
 
                 let force_recursive_stream = stream_id >= n_streams_non_recursive;
 
-                let mut witness = witness.unwrap();
+                let witness = witness.unwrap();
                 if witness.proof_type == ProofType::Recursive2 {
-                    let id = {
-                        let mut rec2_proofs = recursive2_proofs_ongoing_clone.write().unwrap();
-                        let id = rec2_proofs.len();
-                        rec2_proofs.push(None);
-                        id
-                    };
+                    // let id = {
+                    //     let mut rec2_proofs = recursive2_proofs_ongoing_clone.write().unwrap();
+                    //     let id = rec2_proofs.len();
+                    //     rec2_proofs.push(None);
+                    //     id
+                    // };
 
-                    witness.global_idx = Some(id);
+                    // witness.global_idx = Some(id);
                 }
 
                 let new_proof = match gen_recursive_proof_size(&pctx_clone, &setups_clone, &witness) {
@@ -2382,7 +2390,22 @@ where
                         let p2 = recursive2_airgroup_proofs.pop().unwrap();
                         let p3 = recursive2_airgroup_proofs.pop().unwrap();
 
-                        let w = gen_witness_aggregation(&pctx_clone, &setups_clone, &p1, &p2, &p3, &output_dir_path);
+                        let global_idx = {
+                            let mut rec2_proofs = recursive2_proofs_ongoing_clone.write().unwrap();
+                            let global_idx = rec2_proofs.len();
+                            rec2_proofs.push(None);
+                            global_idx
+                        };
+
+                        let w = gen_witness_aggregation(
+                            &pctx_clone,
+                            &setups_clone,
+                            &p1,
+                            &p2,
+                            &p3,
+                            &output_dir_path,
+                            global_idx,
+                        );
 
                         let witness = match w {
                             Ok(witness) => witness,
@@ -2426,16 +2449,19 @@ where
                 continue;
             }
 
-            let mut witness = witness.unwrap();
+            let witness = witness.unwrap();
 
-            let id = {
-                let mut rec2_proofs = recursive2_proofs_ongoing_clone.write().unwrap();
-                let id = rec2_proofs.len();
-                rec2_proofs.push(None);
-                id
-            };
+            let id = witness.global_idx.unwrap();
 
-            witness.global_idx = Some(id);
+            // let id = {
+            //     let mut rec2_proofs = recursive2_proofs_ongoing_clone.write().unwrap();
+            //     let id = rec2_proofs.len();
+            //     rec2_proofs.push(None);
+            //     id
+            // };
+
+            // witness.global_idx = Some(id);
+
 
             let new_proof = match gen_recursive_proof_size(&pctx_clone, &setups_clone, &witness) {
                 Ok(p) => p,
@@ -2606,18 +2632,18 @@ where
         let output_dir_path_clone = options.output_dir_path.clone();
         let save_proofs = options.save_proofs;
         let recursive2_handle = std::thread::spawn(move || {
-            while let Ok(mut witness) = rec2_witness_rx.recv() {
+            while let Ok(witness) = rec2_witness_rx.recv() {
                 if cancellation_info_clone.read().unwrap().token.is_cancelled() {
                     break;
                 }
-                let id = {
-                    let mut rec2_proofs = recursive2_proofs_ongoing_clone.write().unwrap();
-                    let id = rec2_proofs.len();
-                    rec2_proofs.push(None);
-                    id
-                };
+                // let id = {
+                //     let mut rec2_proofs = recursive2_proofs_ongoing_clone.write().unwrap();
+                //     let id = rec2_proofs.len();
+                //     rec2_proofs.push(None);
+                //     id
+                // };
 
-                witness.global_idx = Some(id);
+                // witness.global_idx = Some(id);
 
                 let new_proof = match gen_recursive_proof_size(&pctx_clone, &setups_clone, &witness) {
                     Ok(p) => p,
@@ -2687,7 +2713,23 @@ where
                         let p1 = recursive2_airgroup_proofs.pop().unwrap();
                         let p2 = recursive2_airgroup_proofs.pop().unwrap();
                         let p3 = recursive2_airgroup_proofs.pop().unwrap();
-                        let w = gen_witness_aggregation(&pctx_clone, &setups_clone, &p1, &p2, &p3, &output_dir_path);
+
+                        let global_idx = {
+                            let mut rec2_proofs = recursive2_proofs_ongoing_clone.write().unwrap();
+                            let global_idx = rec2_proofs.len();
+                            rec2_proofs.push(None);
+                            global_idx
+                        };
+
+                        let w = gen_witness_aggregation(
+                            &pctx_clone,
+                            &setups_clone,
+                            &p1,
+                            &p2,
+                            &p3,
+                            &output_dir_path,
+                            global_idx,
+                        );
                         let witness = match w {
                             Ok(witness) => witness,
                             Err(e) => {
