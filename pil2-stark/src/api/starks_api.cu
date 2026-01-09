@@ -26,7 +26,7 @@ struct MaxSizes
     uint64_t nRecursiveStreams;
 };
 
-uint32_t selectStream(DeviceCommitBuffers* d_buffers, uint64_t airgroupId, uint64_t airId, std::string proofType, bool recursive = false, bool force_recursive = false);
+uint32_t selectStream(DeviceCommitBuffers* d_buffers, uint64_t instanceId, uint64_t airgroupId, uint64_t airId, std::string proofType, bool recursive = false, bool force_recursive = false);
 void reserveStream(DeviceCommitBuffers* d_buffers, uint32_t streamId);
 void closeStreamTimer(TimerGPU &timer, uint64_t instanceId, uint64_t airgroupId, uint64_t airId, bool isProve);
 void get_proof(DeviceCommitBuffers *d_buffers, uint64_t streamId);
@@ -393,7 +393,7 @@ uint64_t gen_proof(void *pSetupCtx_, uint64_t airgroupId, uint64_t airId, uint64
     std::string proofType = "basic";
 
     DeviceCommitBuffers *d_buffers = (DeviceCommitBuffers *)d_buffers_;
-    uint32_t streamId = skipRecalculation ? streamId_ : selectStream(d_buffers, airgroupId, airId, proofType, false);
+    uint32_t streamId = skipRecalculation ? streamId_ : selectStream(d_buffers, instanceId, airgroupId, airId, proofType, false);
     if (skipRecalculation) reserveStream(d_buffers, streamId);
     uint32_t gpuId = d_buffers->streamsData[streamId].gpuId;
     uint32_t gpuLocalId = d_buffers->gpus_g2l[gpuId];
@@ -428,13 +428,13 @@ uint64_t gen_proof(void *pSetupCtx_, uint64_t airgroupId, uint64_t airId, uint64
 
     if (setupCtx->starkInfo.mapTotalNCustomCommitsFixed > 0) {
         Goldilocks::Element *pCustomCommitsFixed = (Goldilocks::Element *)d_aux_trace + setupCtx->starkInfo.mapOffsets[std::make_pair("custom_fixed", false)];
-        copy_to_device_in_chunks(d_buffers, params->pCustomCommitsFixed, pCustomCommitsFixed, setupCtx->starkInfo.mapTotalNCustomCommitsFixed * sizeof(Goldilocks::Element), streamId, timer);
+        copy_to_device_in_chunks(d_buffers, params->pCustomCommitsFixed, pCustomCommitsFixed, setupCtx->starkInfo.mapTotalNCustomCommitsFixed * sizeof(Goldilocks::Element), streamId, timer, instanceId);
     }
 
     if (!skipRecalculation) {
         uint64_t total_size = air_instance_info->is_packed ? air_instance_info->num_packed_words * N * sizeof(Goldilocks::Element) : N * nCols * sizeof(Goldilocks::Element);
         uint64_t *dst = (uint64_t *)(d_aux_trace + offsetStage1Extended);
-        copy_to_device_in_chunks(d_buffers, params->trace, dst, total_size, streamId, timer);
+        copy_to_device_in_chunks(d_buffers, params->trace, dst, total_size, streamId, timer, instanceId);
     }
     
     size_t totalCopySize = 0;
@@ -462,7 +462,7 @@ uint64_t gen_proof(void *pSetupCtx_, uint64_t airgroupId, uint64_t airId, uint64
     }
     memcpy(aux_values + offset, (Goldilocks::Element *)globalChallenge, FIELD_EXTENSION * sizeof(Goldilocks::Element));
 
-    copy_to_device_in_chunks(d_buffers, aux_values, (uint8_t*)(d_aux_trace + offsetPublicInputs), totalCopySize * sizeof(Goldilocks::Element), streamId, timer);
+    copy_to_device_in_chunks(d_buffers, aux_values, (uint8_t*)(d_aux_trace + offsetPublicInputs), totalCopySize * sizeof(Goldilocks::Element), streamId, timer, instanceId);
 
     gl64_t *d_const_pols = d_buffers->d_constPols[gpuLocalId] + air_instance_info->const_pols_offset;
     gl64_t *d_const_tree;
@@ -473,7 +473,7 @@ uint64_t gen_proof(void *pSetupCtx_, uint64_t airgroupId, uint64_t airId, uint64
         d_const_tree = d_aux_trace + offsetConstTree;
 
         if (!reuse_constants && !setupCtx->starkInfo.calculateFixedExtended) {
-            load_and_copy_to_device_in_chunks(d_buffers, constTreePath, (uint8_t*)d_const_tree, sizeConstTree, streamId);
+            load_and_copy_to_device_in_chunks(d_buffers, constTreePath, (uint8_t*)d_const_tree, sizeConstTree, streamId, instanceId);
         }
     }
 
@@ -561,7 +561,7 @@ uint64_t gen_recursive_proof(void *pSetupCtx_, char *globalInfoFile, uint64_t ai
     if(string(proofType) == "recursive1" || string(proofType) == "recursive2") {
         aggregation = true;
     }
-    uint32_t streamId = selectStream(d_buffers, airgroupId, airId, proofType, aggregation, force_recursive_stream);
+    uint32_t streamId = selectStream(d_buffers, instanceId, airgroupId, airId, proofType, aggregation, force_recursive_stream);
     uint32_t gpuId = d_buffers->streamsData[streamId].gpuId;
     uint32_t gpuLocalId = d_buffers->gpus_g2l[gpuId];
 
@@ -592,10 +592,10 @@ uint64_t gen_recursive_proof(void *pSetupCtx_, char *globalInfoFile, uint64_t ai
     d_buffers->streamsData[streamId].proofType = string(proofType);
 
     uint64_t offsetStage1Extended = setupCtx->starkInfo.mapOffsets[std::make_pair("cm1", true)];
-    copy_to_device_in_chunks(d_buffers, trace, (uint8_t*)(d_aux_trace + offsetStage1Extended), sizeTrace, streamId, timer);
+    copy_to_device_in_chunks(d_buffers, trace, (uint8_t*)(d_aux_trace + offsetStage1Extended), sizeTrace, streamId, timer, instanceId);
     
     uint64_t offsetPublicInputs = setupCtx->starkInfo.mapOffsets[std::make_pair("publics", false)];
-    copy_to_device_in_chunks(d_buffers, pPublicInputs, (uint8_t*)(d_aux_trace + offsetPublicInputs), setupCtx->starkInfo.nPublics * sizeof(Goldilocks::Element), streamId, timer);
+    copy_to_device_in_chunks(d_buffers, pPublicInputs, (uint8_t*)(d_aux_trace + offsetPublicInputs), setupCtx->starkInfo.nPublics * sizeof(Goldilocks::Element), streamId, timer, instanceId);
 
     gl64_t *d_const_pols = d_buffers->d_constPolsAggregation[gpuLocalId] + air_instance_info->const_pols_offset;
     gl64_t *d_const_tree;
@@ -606,7 +606,7 @@ uint64_t gen_recursive_proof(void *pSetupCtx_, char *globalInfoFile, uint64_t ai
         d_const_tree = d_aux_trace + offsetConstTree;
 
         if (!reuse_constants) {
-            load_and_copy_to_device_in_chunks(d_buffers, constTreePath, (uint8_t*)d_const_tree, sizeConstTree, streamId);
+            load_and_copy_to_device_in_chunks(d_buffers, constTreePath, (uint8_t*)d_const_tree, sizeConstTree, streamId, instanceId);
         }
     }
 
@@ -620,7 +620,7 @@ uint64_t commit_witness(uint64_t arity, uint64_t nBits, uint64_t nBitsExt, uint6
 
     SetupCtx *setupCtx = (SetupCtx *)pSetupCtx_;
     DeviceCommitBuffers *d_buffers = (DeviceCommitBuffers *)d_buffers_;
-    uint32_t streamId = selectStream(d_buffers, airgroupId, airId, "basic");
+    uint32_t streamId = selectStream(d_buffers, instanceId, airgroupId, airId, "basic");
     uint32_t gpuId = d_buffers->streamsData[streamId].gpuId;
     uint32_t gpuLocalId = d_buffers->gpus_g2l[gpuId];
 
@@ -644,7 +644,7 @@ uint64_t commit_witness(uint64_t arity, uint64_t nBits, uint64_t nBitsExt, uint6
     uint64_t offsetStage1Extended = setupCtx->starkInfo.mapOffsets[std::make_pair("cm1", true)];
     uint64_t total_size = air_instance_info->is_packed ? air_instance_info->num_packed_words * N * sizeof(Goldilocks::Element) : sizeTrace;
     uint64_t *dst = (uint64_t*)(d_aux_trace + offsetStage1Extended);
-    copy_to_device_in_chunks(d_buffers, trace, dst, total_size, streamId, timer);
+    copy_to_device_in_chunks(d_buffers, trace, dst, total_size, streamId, timer, instanceId);
     genCommit_gpu(arity, nBits, nBitsExt, nCols, d_aux_trace, d_buffers->streamsData[streamId].pinned_buffer_proof, setupCtx, air_instance_info, timer, stream);
     cudaEventRecord(d_buffers->streamsData[streamId].end_event, stream);
     d_buffers->streamsData[streamId].status = 2;
@@ -846,7 +846,10 @@ uint64_t get_num_gpus() {
     return deviceCount;
 }
 
-uint32_t selectStream(DeviceCommitBuffers* d_buffers, uint64_t airgroupId, uint64_t airId, std::string proofType, bool recursive, bool force_recursive){
+uint32_t selectStream(DeviceCommitBuffers* d_buffers, uint64_t instanceId, uint64_t airgroupId, uint64_t airId, std::string proofType, bool recursive, bool force_recursive){
+    zklog.debug(">>> SELECT_STREAM_MUTEX_" + std::to_string(instanceId) + "\n");
+    auto mutex_wait_start = std::chrono::high_resolution_clock::now();
+
     uint32_t countFreeStreamsGPU[d_buffers->n_gpus];
     uint32_t countUnusedStreams[d_buffers->n_gpus];
     int streamIdxGPU[d_buffers->n_gpus];
@@ -934,6 +937,10 @@ uint32_t selectStream(DeviceCommitBuffers* d_buffers, uint64_t airgroupId, uint6
 
     reserveStream(d_buffers, selectedStreamId);
     d_buffers->streamsData[selectedStreamId].mutex_stream_selection.unlock();
+
+    auto mutex_wait_end = std::chrono::high_resolution_clock::now();
+    auto mutex_wait_us = std::chrono::duration_cast<std::chrono::microseconds>(mutex_wait_end - mutex_wait_start).count();
+    zklog.debug("<<< SELECT_STREAM_MUTEX_" + std::to_string(instanceId) + " (" + std::to_string(mutex_wait_us / 1000) + "ms)\n");
 
     return selectedStreamId;
 }

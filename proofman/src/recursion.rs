@@ -272,8 +272,9 @@ pub fn generate_recursive_proof<F: PrimeField64>(
 ) -> ProofmanResult<u64> {
     timer_start_debug!(
         GEN_RECURSIVE_PROOF,
-        "GEN_RECURSIVE_PROOF_{:?} [{}:{}]",
+        "GEN_RECURSIVE_PROOF_{:?}_{} [{}:{}]",
         witness.proof_type,
+        witness.global_idx.unwrap_or(0),
         witness.airgroup_id,
         witness.air_id
     );
@@ -373,8 +374,9 @@ pub fn generate_recursive_proof<F: PrimeField64>(
 
     timer_stop_and_log_debug!(
         GEN_RECURSIVE_PROOF,
-        "GEN_RECURSIVE_PROOF_{:?} [{}:{}]",
+        "GEN_RECURSIVE_PROOF_{:?}_{} [{}:{}]",
         witness.proof_type,
+        witness.global_idx.unwrap_or(0),
         witness.airgroup_id,
         witness.air_id
     );

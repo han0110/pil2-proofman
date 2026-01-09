@@ -1,5 +1,5 @@
 use crossbeam_channel::{bounded, Sender, Receiver};
-use proofman_util::create_buffer_fast;
+use proofman_util::{create_buffer_fast, timer_start_debug, timer_stop_and_log_debug};
 use std::sync::Arc;
 use crossbeam_queue::SegQueue;
 use crate::ProofCtx;
@@ -70,13 +70,16 @@ impl<F: PrimeField64 + Send + Sync + 'static> MemoryHandler<F> {
     }
 
     pub fn take_buffer(&self) -> Vec<F> {
+        timer_start_debug!(TAKE_BUFFER);
         loop {
             if let Ok(buffer) = self.receiver.try_recv() {
+                timer_stop_and_log_debug!(TAKE_BUFFER);
                 return buffer;
             }
             if let Some(stored_instance_id) = self.instance_ids_to_be_released.pop() {
                 let (is_shared_buffer, witness_buffer) = self.pctx.free_instance_traces(stored_instance_id);
                 if is_shared_buffer {
+                    timer_stop_and_log_debug!(TAKE_BUFFER);
                     return witness_buffer;
                 }
             }

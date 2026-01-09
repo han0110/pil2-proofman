@@ -384,7 +384,8 @@ void copy_to_device_in_chunks(
     void* dst,
     uint64_t total_size,
     uint64_t streamId,
-    TimerGPU &timer
+    TimerGPU &timer,
+    uint64_t instanceId
     );
 
 void load_and_copy_to_device_in_chunks(
@@ -392,7 +393,8 @@ void load_and_copy_to_device_in_chunks(
     const char* bufferPath,
     void* dst,
     uint64_t total_size,
-    uint64_t streamId
+    uint64_t streamId,
+    uint64_t instanceId
     );
 #endif
 #endif

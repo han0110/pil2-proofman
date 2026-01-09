@@ -29,6 +29,7 @@
 #include <iostream>
 #include <cstdlib>
 #include <ctime>
+#include <sys/time.h>
 
 // Code Specific Header Files(s)
 #include "logger.hpp"
@@ -311,11 +312,22 @@ void Logger::trace(std::ostringstream& stream) throw()
    trace(text.data());
 }
 
+string getProofmanTimestamp(void)
+{
+   struct timeval tv;
+   gettimeofday(&tv, NULL);
+   char tmbuf[64], buf[256];
+   strftime(tmbuf, sizeof(tmbuf), "%Y-%m-%dT%H:%M:%S", gmtime(&tv.tv_sec));
+   snprintf(buf, sizeof(buf), "%s.%06dZ", tmbuf, (int)tv.tv_usec);
+   return buf;
+}
+
 // Interface for Debug Log
 void Logger::debug(const char* text) throw()
 {
    string data;
-   data.append("[DEBUG] PilStark: ");
+   data.append(getProofmanTimestamp());
+   data.append(" [rank=0] DEBUG: ");
    data.append(text);
 
    if((m_LogType == FILE_LOG) && (m_LogLevel >= LOG_LEVEL_DEBUG))

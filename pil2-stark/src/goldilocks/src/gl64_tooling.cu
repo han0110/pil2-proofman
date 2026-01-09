@@ -6,14 +6,24 @@ void copy_to_device_in_chunks(
     void* dst,
     uint64_t total_size,
     uint64_t streamId,
-    TimerGPU &timer
+    TimerGPU &timer,
+    uint64_t instanceId
     ){
     uint32_t gpuId = d_buffers->streamsData[streamId].gpuId;
 
     cudaSetDevice(gpuId);
 
     uint32_t gpuLocalId = d_buffers->gpus_g2l[gpuId];
+
+    zklog.debug(">>> COPY_TO_DEVICE_MUTEX_" + std::to_string(instanceId) + "\n");
+    auto mutex_wait_start = std::chrono::high_resolution_clock::now();
+
     std::lock_guard<std::mutex> lock(d_buffers->mutex_pinned[gpuLocalId]);
+
+    auto mutex_wait_end = std::chrono::high_resolution_clock::now();
+    auto mutex_wait_us = std::chrono::duration_cast<std::chrono::microseconds>(mutex_wait_end - mutex_wait_start).count();
+    zklog.debug("<<< COPY_TO_DEVICE_MUTEX_" + std::to_string(instanceId) + " (" + std::to_string(mutex_wait_us / 1000) + "ms)\n");
+
 
     uint64_t block_size = d_buffers->pinned_size;
     
@@ -68,7 +78,8 @@ void load_and_copy_to_device_in_chunks(
     const char* bufferPath,
     void* dst,
     uint64_t total_size,
-    uint64_t streamId
+    uint64_t streamId,
+    uint64_t instanceId
     ){
 
     uint32_t gpuId = d_buffers->streamsData[streamId].gpuId;
@@ -76,8 +87,16 @@ void load_and_copy_to_device_in_chunks(
     cudaSetDevice(gpuId);
 
     uint32_t gpuLocalId = d_buffers->gpus_g2l[gpuId];
-    std::lock_guard<std::mutex> lock(d_buffers->mutex_pinned[gpuLocalId]);
     
+    zklog.debug(">>> LOAD_AND_COPY_TO_DEVICE_MUTEX_" + std::to_string(instanceId) + "\n");
+    auto mutex_wait_start = std::chrono::high_resolution_clock::now();
+
+    std::lock_guard<std::mutex> lock(d_buffers->mutex_pinned[gpuLocalId]);
+
+    auto mutex_wait_end = std::chrono::high_resolution_clock::now();
+    auto mutex_wait_us = std::chrono::duration_cast<std::chrono::microseconds>(mutex_wait_end - mutex_wait_start).count();
+    zklog.debug("<<< LOAD_AND_COPY_TO_DEVICE_MUTEX_" + std::to_string(instanceId) + " (" + std::to_string(mutex_wait_us / 1000) + "ms)\n");
+
     uint64_t block_size = d_buffers->pinned_size;
     
     cudaStream_t stream = d_buffers->streamsData[streamId].stream;
