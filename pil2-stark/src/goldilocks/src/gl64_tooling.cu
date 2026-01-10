@@ -21,9 +21,11 @@ void copy_to_device_in_chunks(
     std::lock_guard<std::mutex> lock(d_buffers->mutex_pinned[gpuLocalId]);
 
     auto mutex_wait_end = std::chrono::high_resolution_clock::now();
-    auto mutex_wait_us = std::chrono::duration_cast<std::chrono::microseconds>(mutex_wait_end - mutex_wait_start).count();
-    zklog.debug("<<< COPY_TO_DEVICE_MUTEX_" + std::to_string(instanceId) + " (" + std::to_string(mutex_wait_us / 1000) + "ms)\n");
+    auto mutex_wait_ms = std::chrono::duration_cast<std::chrono::milliseconds>(mutex_wait_end - mutex_wait_start).count();
+    zklog.debug("<<< COPY_TO_DEVICE_MUTEX_" + std::to_string(instanceId) + " (" + std::to_string(mutex_wait_ms) + "ms)\n");
 
+    zklog.debug(">>> COPY_TO_DEVICE_" + std::to_string(instanceId) + "\n");
+    mutex_wait_start = std::chrono::high_resolution_clock::now();
 
     uint64_t block_size = d_buffers->pinned_size;
     
@@ -71,6 +73,10 @@ void copy_to_device_in_chunks(
     ));
 
     CHECKCUDAERR(cudaStreamSynchronize(stream));
+
+    mutex_wait_end = std::chrono::high_resolution_clock::now();
+    mutex_wait_ms = std::chrono::duration_cast<std::chrono::milliseconds>(mutex_wait_end - mutex_wait_start).count();
+    zklog.debug("<<< COPY_TO_DEVICE_" + std::to_string(instanceId) + " (" + std::to_string(mutex_wait_ms) + "ms)\n");
 }
 
 void load_and_copy_to_device_in_chunks(
@@ -94,8 +100,11 @@ void load_and_copy_to_device_in_chunks(
     std::lock_guard<std::mutex> lock(d_buffers->mutex_pinned[gpuLocalId]);
 
     auto mutex_wait_end = std::chrono::high_resolution_clock::now();
-    auto mutex_wait_us = std::chrono::duration_cast<std::chrono::microseconds>(mutex_wait_end - mutex_wait_start).count();
-    zklog.debug("<<< LOAD_AND_COPY_TO_DEVICE_MUTEX_" + std::to_string(instanceId) + " (" + std::to_string(mutex_wait_us / 1000) + "ms)\n");
+    auto mutex_wait_ms = std::chrono::duration_cast<std::chrono::milliseconds>(mutex_wait_end - mutex_wait_start).count();
+    zklog.debug("<<< LOAD_AND_COPY_TO_DEVICE_MUTEX_" + std::to_string(instanceId) + " (" + std::to_string(mutex_wait_ms) + "ms)\n");
+
+    zklog.debug(">>> LOAD_AND_COPY_TO_DEVICE_" + std::to_string(instanceId) + "\n");
+    mutex_wait_start = std::chrono::high_resolution_clock::now();
 
     uint64_t block_size = d_buffers->pinned_size;
     
@@ -140,4 +149,8 @@ void load_and_copy_to_device_in_chunks(
     ));
 
     CHECKCUDAERR(cudaStreamSynchronize(stream));
+
+    mutex_wait_end = std::chrono::high_resolution_clock::now();
+    mutex_wait_ms = std::chrono::duration_cast<std::chrono::milliseconds>(mutex_wait_end - mutex_wait_start).count();
+    zklog.debug("<<< LOAD_AND_COPY_TO_DEVICE_" + std::to_string(instanceId) + " (" + std::to_string(mutex_wait_ms) + "ms)\n");
 }

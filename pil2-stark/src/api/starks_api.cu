@@ -939,8 +939,8 @@ uint32_t selectStream(DeviceCommitBuffers* d_buffers, uint64_t instanceId, uint6
     d_buffers->streamsData[selectedStreamId].mutex_stream_selection.unlock();
 
     auto mutex_wait_end = std::chrono::high_resolution_clock::now();
-    auto mutex_wait_us = std::chrono::duration_cast<std::chrono::microseconds>(mutex_wait_end - mutex_wait_start).count();
-    zklog.debug("<<< SELECT_STREAM_MUTEX_" + std::to_string(instanceId) + " (" + std::to_string(mutex_wait_us / 1000) + "ms)\n");
+    auto mutex_wait_ms = std::chrono::duration_cast<std::chrono::milliseconds>(mutex_wait_end - mutex_wait_start).count();
+    zklog.debug("<<< SELECT_STREAM_MUTEX_" + std::to_string(instanceId) + " (" + std::to_string(mutex_wait_ms) + "ms)\n");
 
     return selectedStreamId;
 }
