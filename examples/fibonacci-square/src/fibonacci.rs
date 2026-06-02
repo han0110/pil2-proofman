@@ -52,7 +52,7 @@ impl<F: PrimeField64> WitnessComponent<F> for FibonacciSquare {
             let mut a = F::as_canonical_u64(&publics.in1);
             let mut b = F::as_canonical_u64(&publics.in2);
 
-            let mut trace = FibonacciSquareTrace::new_from_vec_zeroes(buffer_pool.take_buffer())?;
+            let mut trace = FibonacciSquareTrace::new_from_vec_zeroes(buffer_pool.take_buffer()?)?;
 
             trace[0].a = F::from_u64(a);
             trace[0].b = F::from_u64(b);
