@@ -6,6 +6,15 @@ use crate::ProofCtx;
 use fields::PrimeField64;
 use crate::{ProofmanError, ProofmanResult};
 
+pub trait CancelChecker: Send + Sync {
+    fn is_cancelled(&self) -> bool;
+}
+
+#[inline]
+fn checker_is_cancelled(checker: &Option<Arc<dyn CancelChecker>>) -> bool {
+    checker.as_ref().is_some_and(|c| c.is_cancelled())
+}
+
 pub struct MemoryHandler<F: PrimeField64 + Send + Sync + 'static> {
     pctx: Arc<ProofCtx<F>>,
     instance_ids_to_be_released: Arc<SegQueue<(usize, bool)>>,
@@ -13,10 +22,16 @@ pub struct MemoryHandler<F: PrimeField64 + Send + Sync + 'static> {
     receiver: Receiver<Vec<F>>,
     n_buffers: usize,
     buffer_size: usize,
+    cancellation: Option<Arc<dyn CancelChecker>>,
 }
 
 impl<F: PrimeField64 + Send + Sync + 'static> MemoryHandler<F> {
-    pub fn new(pctx: Arc<ProofCtx<F>>, n_buffers: usize, buffer_size: usize) -> Self {
+    pub fn new(
+        pctx: Arc<ProofCtx<F>>,
+        n_buffers: usize,
+        buffer_size: usize,
+        cancellation: Option<Arc<dyn CancelChecker>>,
+    ) -> Self {
         let (tx_buffer_pool, rx_buffer_pool) = bounded(n_buffers);
         let instance_ids_to_be_released = Arc::new(SegQueue::new());
         for _ in 0..n_buffers {
@@ -33,6 +48,7 @@ impl<F: PrimeField64 + Send + Sync + 'static> MemoryHandler<F> {
             instance_ids_to_be_released,
             n_buffers,
             buffer_size,
+            cancellation,
         }
     }
 
@@ -72,10 +88,10 @@ impl<F: PrimeField64 + Send + Sync + 'static> MemoryHandler<F> {
         Ok(())
     }
 
-    pub fn take_buffer(&self) -> Vec<F> {
+    pub fn take_buffer(&self) -> ProofmanResult<Vec<F>> {
         loop {
             if let Ok(buffer) = self.receiver.try_recv() {
-                return buffer;
+                return Ok(buffer);
             }
             if let Some((stored_instance_id, remove_from_calculated)) = self.instance_ids_to_be_released.pop() {
                 if remove_from_calculated {
@@ -83,8 +99,11 @@ impl<F: PrimeField64 + Send + Sync + 'static> MemoryHandler<F> {
                 }
                 let (is_shared_buffer, witness_buffer) = self.pctx.free_instance_traces(stored_instance_id);
                 if is_shared_buffer {
-                    return witness_buffer;
+                    return Ok(witness_buffer);
                 }
+            }
+            if checker_is_cancelled(&self.cancellation) {
+                return Err(ProofmanError::Cancelled);
             }
             std::thread::sleep(std::time::Duration::from_micros(10));
         }
@@ -121,11 +140,11 @@ pub trait BufferPool<F: PrimeField64>: Send + Sync
 where
     F: Send + Sync + 'static,
 {
-    fn take_buffer(&self) -> Vec<F>;
+    fn take_buffer(&self) -> ProofmanResult<Vec<F>>;
 }
 
 impl<F: PrimeField64 + Send + Sync + 'static> BufferPool<F> for MemoryHandler<F> {
-    fn take_buffer(&self) -> Vec<F> {
+    fn take_buffer(&self) -> ProofmanResult<Vec<F>> {
         self.take_buffer()
     }
 }
@@ -145,6 +164,7 @@ pub struct MemoryHandlerRecursive<F: PrimeField64 + Send + Sync + 'static> {
     buffer_size_witness: usize,
     buffer_size_trace: usize,
     buffer_size_trace_compressor: usize,
+    cancellation: Option<Arc<dyn CancelChecker>>,
 }
 
 impl<F: PrimeField64 + Send + Sync + 'static> MemoryHandlerRecursive<F> {
@@ -155,6 +175,7 @@ impl<F: PrimeField64 + Send + Sync + 'static> MemoryHandlerRecursive<F> {
         buffer_size_witness_compressor: usize,
         buffer_size_trace: usize,
         buffer_size_trace_compressor: usize,
+        cancellation: Option<Arc<dyn CancelChecker>>,
     ) -> Self {
         let (tx_witness, rx_witness) = bounded(n_buffers);
         let (tx_witness_compressor, rx_witness_compressor) = bounded(n_buffers_compressor);
@@ -199,6 +220,7 @@ impl<F: PrimeField64 + Send + Sync + 'static> MemoryHandlerRecursive<F> {
             buffer_size_witness_compressor,
             buffer_size_trace,
             buffer_size_trace_compressor,
+            cancellation,
         }
     }
 
@@ -330,10 +352,13 @@ impl<F: PrimeField64 + Send + Sync + 'static> MemoryHandlerRecursive<F> {
         Ok(())
     }
 
-    pub fn take_buffer_witness(&self) -> Vec<F> {
+    pub fn take_buffer_witness(&self) -> ProofmanResult<Vec<F>> {
         loop {
             if let Ok(buffer) = self.receiver_witness.try_recv() {
-                return buffer;
+                return Ok(buffer);
+            }
+            if checker_is_cancelled(&self.cancellation) {
+                return Err(ProofmanError::Cancelled);
             }
             std::thread::sleep(std::time::Duration::from_micros(10));
         }
@@ -351,10 +376,13 @@ impl<F: PrimeField64 + Send + Sync + 'static> MemoryHandlerRecursive<F> {
         Ok(())
     }
 
-    pub fn take_buffer_witness_compressor(&self) -> Vec<F> {
+    pub fn take_buffer_witness_compressor(&self) -> ProofmanResult<Vec<F>> {
         loop {
             if let Ok(buffer) = self.receiver_witness_compressor.try_recv() {
-                return buffer;
+                return Ok(buffer);
+            }
+            if checker_is_cancelled(&self.cancellation) {
+                return Err(ProofmanError::Cancelled);
             }
             std::thread::sleep(std::time::Duration::from_micros(10));
         }
@@ -372,10 +400,13 @@ impl<F: PrimeField64 + Send + Sync + 'static> MemoryHandlerRecursive<F> {
         Ok(())
     }
 
-    pub fn take_buffer_trace(&self) -> Vec<F> {
+    pub fn take_buffer_trace(&self) -> ProofmanResult<Vec<F>> {
         loop {
             if let Ok(buffer) = self.receiver_trace.try_recv() {
-                return buffer;
+                return Ok(buffer);
+            }
+            if checker_is_cancelled(&self.cancellation) {
+                return Err(ProofmanError::Cancelled);
             }
             std::thread::sleep(std::time::Duration::from_micros(10));
         }
@@ -393,10 +424,13 @@ impl<F: PrimeField64 + Send + Sync + 'static> MemoryHandlerRecursive<F> {
         Ok(())
     }
 
-    pub fn take_buffer_trace_compressor(&self) -> Vec<F> {
+    pub fn take_buffer_trace_compressor(&self) -> ProofmanResult<Vec<F>> {
         loop {
             if let Ok(buffer) = self.receiver_trace_compressor.try_recv() {
-                return buffer;
+                return Ok(buffer);
+            }
+            if checker_is_cancelled(&self.cancellation) {
+                return Err(ProofmanError::Cancelled);
             }
             std::thread::sleep(std::time::Duration::from_micros(10));
         }

@@ -300,8 +300,8 @@ pub fn generate_recursive_proof<F: PrimeField64>(
     let setup = setups.get_setup(airgroup_id, air_id, &witness.proof_type)?;
 
     let mut trace = match setup.setup_type {
-        ProofType::Compressor => memory_handler_recursive_witness.take_buffer_trace_compressor(),
-        _ => memory_handler_recursive_witness.take_buffer_trace(),
+        ProofType::Compressor => memory_handler_recursive_witness.take_buffer_trace_compressor()?,
+        _ => memory_handler_recursive_witness.take_buffer_trace()?,
     };
 
     let p_setup: *mut c_void = (&setup.p_setup).into();
@@ -442,8 +442,11 @@ pub fn aggregate_worker_proofs<F: PrimeField64>(
     }
 
     // agregation loop
+    let mut deferred: Option<ProofmanError> = None;
     loop {
-        mpi_ctx.barrier();
+        if !mpi_ctx.all_finished_ok(deferred.is_none()) {
+            return Err(deferred.unwrap_or(ProofmanError::Cancelled));
+        }
         mpi_ctx.distribute_recursive2_proofs(&alives, &mut airgroup_proofs);
         let mut pending_agregations = false;
         for airgroup in 0..n_airgroups {
@@ -452,72 +455,82 @@ pub fn aggregate_worker_proofs<F: PrimeField64>(
             if alive > 1 {
                 let n_agg_proofs = alive / N_RECURSIVE_PROOFS_PER_AGGREGATION;
                 let n_remaining_proofs = alive % N_RECURSIVE_PROOFS_PER_AGGREGATION;
-                for i in 0..alive.div_ceil(N_RECURSIVE_PROOFS_PER_AGGREGATION) {
-                    let j = i * N_RECURSIVE_PROOFS_PER_AGGREGATION;
-                    if airgroup_proofs[airgroup][j].is_none() {
-                        continue;
-                    }
-                    if (j + N_RECURSIVE_PROOFS_PER_AGGREGATION - 1 < alive)
-                        || alive <= N_RECURSIVE_PROOFS_PER_AGGREGATION
-                    {
-                        if airgroup_proofs[airgroup][j + 1].is_none() {
-                            return Err(ProofmanError::ProofmanError("Recursive2 proof is missing".into()));
+                if deferred.is_none() {
+                    let result: ProofmanResult<()> = (|| {
+                        for i in 0..alive.div_ceil(N_RECURSIVE_PROOFS_PER_AGGREGATION) {
+                            let j = i * N_RECURSIVE_PROOFS_PER_AGGREGATION;
+                            if airgroup_proofs[airgroup][j].is_none() {
+                                continue;
+                            }
+                            if (j + N_RECURSIVE_PROOFS_PER_AGGREGATION - 1 < alive)
+                                || alive <= N_RECURSIVE_PROOFS_PER_AGGREGATION
+                            {
+                                if airgroup_proofs[airgroup][j + 1].is_none() {
+                                    return Err(ProofmanError::ProofmanError("Recursive2 proof is missing".into()));
+                                }
+
+                                let proof1 = Proof::new(
+                                    ProofType::Recursive2,
+                                    airgroup,
+                                    0,
+                                    None,
+                                    airgroup_proofs[airgroup][j].take().unwrap(),
+                                );
+
+                                let proof2 = Proof::new(
+                                    ProofType::Recursive2,
+                                    airgroup,
+                                    0,
+                                    None,
+                                    airgroup_proofs[airgroup][j + 1].take().unwrap(),
+                                );
+
+                                let proof_3 = if j + N_RECURSIVE_PROOFS_PER_AGGREGATION - 1 < alive {
+                                    airgroup_proofs[airgroup][j + N_RECURSIVE_PROOFS_PER_AGGREGATION - 1]
+                                        .take()
+                                        .unwrap()
+                                } else {
+                                    null_proofs[airgroup].clone()
+                                };
+
+                                let proof3 = Proof::new(ProofType::Recursive2, airgroup, 0, None, proof_3);
+
+                                let mut circom_witness = gen_witness_aggregation::<F>(
+                                    pctx,
+                                    memory_handler_recursive_witness,
+                                    setups,
+                                    &proof1,
+                                    &proof2,
+                                    &proof3,
+                                )?;
+                                circom_witness.global_idx = Some(rank);
+
+                                let recursive2_proof = gen_recursive_proof_size::<F>(pctx, setups, &circom_witness)?;
+
+                                let stream_id = generate_recursive_proof::<F>(
+                                    pctx,
+                                    memory_handler_recursive_witness,
+                                    setups,
+                                    &mut circom_witness,
+                                    &recursive2_proof,
+                                    prover_buffer,
+                                    const_tree,
+                                    const_pols,
+                                    false,
+                                    None,
+                                )?;
+
+                                get_stream_id_proof_c(pctx.get_device_buffers_ptr(), stream_id);
+
+                                airgroup_proofs[airgroup][j] = Some(recursive2_proof.proof);
+
+                                tracing::debug!("··· Recursive 2 Proof generated.");
+                            }
                         }
-
-                        let proof1 = Proof::new(
-                            ProofType::Recursive2,
-                            airgroup,
-                            0,
-                            None,
-                            airgroup_proofs[airgroup][j].take().unwrap(),
-                        );
-
-                        let proof2 = Proof::new(
-                            ProofType::Recursive2,
-                            airgroup,
-                            0,
-                            None,
-                            airgroup_proofs[airgroup][j + 1].take().unwrap(),
-                        );
-
-                        let proof_3 = if j + N_RECURSIVE_PROOFS_PER_AGGREGATION - 1 < alive {
-                            airgroup_proofs[airgroup][j + N_RECURSIVE_PROOFS_PER_AGGREGATION - 1].take().unwrap()
-                        } else {
-                            null_proofs[airgroup].clone()
-                        };
-
-                        let proof3 = Proof::new(ProofType::Recursive2, airgroup, 0, None, proof_3);
-
-                        let mut circom_witness = gen_witness_aggregation::<F>(
-                            pctx,
-                            memory_handler_recursive_witness,
-                            setups,
-                            &proof1,
-                            &proof2,
-                            &proof3,
-                        )?;
-                        circom_witness.global_idx = Some(rank);
-
-                        let recursive2_proof = gen_recursive_proof_size::<F>(pctx, setups, &circom_witness)?;
-
-                        let stream_id = generate_recursive_proof::<F>(
-                            pctx,
-                            memory_handler_recursive_witness,
-                            setups,
-                            &mut circom_witness,
-                            &recursive2_proof,
-                            prover_buffer,
-                            const_tree,
-                            const_pols,
-                            false,
-                            None,
-                        )?;
-
-                        get_stream_id_proof_c(pctx.get_device_buffers_ptr(), stream_id);
-
-                        airgroup_proofs[airgroup][j] = Some(recursive2_proof.proof);
-
-                        tracing::debug!("··· Recursive 2 Proof generated.");
+                        Ok(())
+                    })();
+                    if let Err(e) = result {
+                        deferred = Some(e);
                     }
                 }
                 if n_agg_proofs > 0 {
@@ -545,6 +558,9 @@ pub fn aggregate_worker_proofs<F: PrimeField64>(
         if !pending_agregations {
             break;
         }
+    }
+    if !mpi_ctx.all_finished_ok(deferred.is_none()) {
+        return Err(deferred.unwrap_or(ProofmanError::Cancelled));
     }
 
     if pctx.mpi_ctx.rank == 0 {
@@ -756,7 +772,7 @@ pub fn generate_recursivef_proof<F: PrimeField64>(
         timer_stop_and_log_debug!(LOAD_FIXED_POLS_RECURSIVEF);
     });
 
-    let mut trace: Vec<F> = memory_handler_recursive_witness.take_buffer_trace();
+    let mut trace: Vec<F> = memory_handler_recursive_witness.take_buffer_trace()?;
 
     let proof = &vadcop_proof[1..];
     let mut updated_proof: Vec<u64> = vec![0; proof.len() + 4];
@@ -892,8 +908,8 @@ fn generate_witness<F: PrimeField64>(
     zkin: &[u64],
 ) -> ProofmanResult<Vec<F>> {
     let mut witness: Vec<F> = match setup.setup_type {
-        ProofType::Compressor => memory_handler_recursive_witness.take_buffer_witness_compressor(),
-        _ => memory_handler_recursive_witness.take_buffer_witness(),
+        ProofType::Compressor => memory_handler_recursive_witness.take_buffer_witness_compressor()?,
+        _ => memory_handler_recursive_witness.take_buffer_witness()?,
     };
 
     let state = setup.circom_state.read().unwrap();

@@ -2,9 +2,10 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use libloading::{Library, Symbol};
 use fields::{ExtensionField, Transcript, PrimeField64, GoldilocksQuinticExtension, Poseidon16};
 use proofman_common::{
-    calculate_fixed_tree, configured_num_threads, initialize_logger, load_const_pols, skip_prover_instance, CurveType,
-    PolMap, RowInfo, DebugInfo, MemoryHandler, MemoryHandlerRecursive, MpiCtx, ProofmanOptions, Proof, ProofCtx,
-    ProofOptions, ProofType, RankInfo, SetupCtx, SetupsVadcop, VerboseMode, MAX_INSTANCES, PreLoadedConst,
+    calculate_fixed_tree, configured_num_threads, initialize_logger, load_const_pols, skip_prover_instance,
+    CancelChecker, CurveType, PolMap, RowInfo, DebugInfo, MemoryHandler, MemoryHandlerRecursive, MpiCtx,
+    ProofmanOptions, Proof, ProofCtx, ProofOptions, ProofType, RankInfo, SetupCtx, SetupsVadcop, VerboseMode,
+    MAX_INSTANCES, PreLoadedConst,
 };
 use colored::Colorize;
 use proofman_hints::aggregate_airgroupvals;
@@ -196,6 +197,14 @@ impl CancellationInfo {
     pub fn reset(&mut self) {
         self.token = CancellationToken::new();
         self.error = None;
+    }
+}
+
+struct CancellationFlag(Arc<RwLock<CancellationInfo>>);
+
+impl CancelChecker for CancellationFlag {
+    fn is_cancelled(&self) -> bool {
+        self.0.read().unwrap().token.is_cancelled()
     }
 }
 
@@ -1572,7 +1581,15 @@ where
 
         let max_buffer_size = if options.packed { max_witness_trace_size_packed } else { max_witness_trace_size };
 
-        let memory_handler = Arc::new(MemoryHandler::new(pctx.clone(), max_witness_stored, max_buffer_size));
+        let cancellation_info = Arc::new(RwLock::new(CancellationInfo::default()));
+        let cancellation_checker: Arc<dyn CancelChecker> = Arc::new(CancellationFlag(cancellation_info.clone()));
+
+        let memory_handler = Arc::new(MemoryHandler::new(
+            pctx.clone(),
+            max_witness_stored,
+            max_buffer_size,
+            Some(cancellation_checker.clone()),
+        ));
 
         let memory_handler_recursive_witness = Arc::new(MemoryHandlerRecursive::new(
             max_witness_stored,
@@ -1581,6 +1598,7 @@ where
             setups_vadcop.max_witness_size_compressor,
             setups_vadcop.max_trace_size,
             setups_vadcop.max_trace_size_compressor,
+            Some(cancellation_checker),
         ));
 
         let n_airgroups = pctx.global_info.air_groups.len();
@@ -1719,7 +1737,7 @@ where
             handle_contributions: Arc::new(Mutex::new(Vec::new())),
             outer_agg_proofs_finished: Arc::new(AtomicBool::new(true)),
             worker_contributions: Arc::new(RwLock::new(Vec::new())),
-            cancellation_info: Arc::new(RwLock::new(CancellationInfo::default())),
+            cancellation_info,
             options,
             witness_info: RwLock::new(WitnessInfo::default()),
             reload_fixed_pols_gpu: Arc::new(AtomicBool::new(false)),
@@ -3368,6 +3386,9 @@ where
         }
 
         while n_proofs_to_be_received > 0 {
+            if self.cancellation_info.read().unwrap().token.is_cancelled() {
+                break;
+            }
             for airgroup_id in 0..n_airgroups {
                 let new_proof = self.mpi_ctx.check_incoming_proofs(airgroup_id);
                 if let Some(proof) = new_proof {
