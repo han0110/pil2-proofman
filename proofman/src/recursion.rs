@@ -172,8 +172,16 @@ pub fn gen_witness_aggregation<F: PrimeField64>(
     proof1: &Proof<F>,
     proof2: &Proof<F>,
     proof3: &Proof<F>,
+    global_idx: usize,
 ) -> ProofmanResult<Proof<F>> {
-    timer_start_debug!(GENERATE_WITNESS_AGGREGATION);
+    timer_start_debug!(
+        GENERATE_WITNESS_AGGREGATION,
+        "GENERATE_WITNESS_AGGREGATION_{} [{}+{}+{}]",
+        global_idx,
+        proof1.global_idx.unwrap_or(0),
+        proof2.global_idx.unwrap_or(0),
+        proof3.global_idx.unwrap_or(0)
+    );
     let proof_len = proof1.proof.len();
     if proof_len != proof2.proof.len() || proof_len != proof3.proof.len() {
         return Err(ProofmanError::ProofmanError(format!(
@@ -211,15 +219,26 @@ pub fn gen_witness_aggregation<F: PrimeField64>(
             + ".verkey.json";
 
     add_publics_circom(&mut updated_proof_recursive2, 0, pctx, &recursive2_verkey, true);
-    let circom_witness =
-        generate_witness::<F>(setup_recursive2, memory_handler_recursive_witness, 0, &updated_proof_recursive2)?;
+    let circom_witness = generate_witness::<F>(
+        setup_recursive2,
+        memory_handler_recursive_witness,
+        global_idx,
+        &updated_proof_recursive2,
+    )?;
 
-    timer_stop_and_log_debug!(GENERATE_WITNESS_AGGREGATION);
+    timer_stop_and_log_debug!(
+        GENERATE_WITNESS_AGGREGATION,
+        "GENERATE_WITNESS_AGGREGATION_{} [{}+{}+{}]",
+        global_idx,
+        proof1.global_idx.unwrap_or(0),
+        proof2.global_idx.unwrap_or(0),
+        proof3.global_idx.unwrap_or(0)
+    );
     Ok(Proof::new_witness(
         ProofType::Recursive2,
         airgroup_id,
         0,
-        None,
+        Some(global_idx),
         circom_witness,
         setup_recursive2.n_cols as usize,
     ))
@@ -284,8 +303,9 @@ pub fn generate_recursive_proof<F: PrimeField64>(
 ) -> ProofmanResult<u64> {
     timer_start_debug!(
         GEN_RECURSIVE_PROOF,
-        "GEN_RECURSIVE_PROOF_{:?} [{}:{}]",
+        "GEN_RECURSIVE_PROOF_{:?}_{} [{}:{}]",
         witness.proof_type,
+        witness.global_idx.unwrap_or(0),
         witness.airgroup_id,
         witness.air_id
     );
@@ -299,10 +319,12 @@ pub fn generate_recursive_proof<F: PrimeField64>(
 
     let setup = setups.get_setup(airgroup_id, air_id, &witness.proof_type)?;
 
+    timer_start_debug!(WAIT_TRACE_BUFFER, "WAIT_TRACE_BUFFER_{}", instance_id);
     let mut trace = match setup.setup_type {
         ProofType::Compressor => memory_handler_recursive_witness.take_buffer_trace_compressor(),
         _ => memory_handler_recursive_witness.take_buffer_trace(),
     };
+    timer_stop_and_log_debug!(WAIT_TRACE_BUFFER, "WAIT_TRACE_BUFFER_{}", instance_id);
 
     let p_setup: *mut c_void = (&setup.p_setup).into();
 
@@ -381,8 +403,9 @@ pub fn generate_recursive_proof<F: PrimeField64>(
 
     timer_stop_and_log_debug!(
         GEN_RECURSIVE_PROOF,
-        "GEN_RECURSIVE_PROOF_{:?} [{}:{}]",
+        "GEN_RECURSIVE_PROOF_{:?}_{} [{}:{}]",
         witness.proof_type,
+        witness.global_idx.unwrap_or(0),
         witness.airgroup_id,
         witness.air_id
     );
@@ -495,8 +518,8 @@ pub fn aggregate_worker_proofs<F: PrimeField64>(
                             &proof1,
                             &proof2,
                             &proof3,
+                            rank,
                         )?;
-                        circom_witness.global_idx = Some(rank);
 
                         let recursive2_proof = gen_recursive_proof_size::<F>(pctx, setups, &circom_witness)?;
 
@@ -893,10 +916,12 @@ fn generate_witness<F: PrimeField64>(
     instance_id: usize,
     zkin: &[u64],
 ) -> ProofmanResult<Vec<F>> {
+    timer_start_debug!(WAIT_WITNESS_BUFFER, "WAIT_WITNESS_BUFFER_{}", instance_id);
     let mut witness: Vec<F> = match setup.setup_type {
         ProofType::Compressor => memory_handler_recursive_witness.take_buffer_witness_compressor(),
         _ => memory_handler_recursive_witness.take_buffer_witness(),
     };
+    timer_stop_and_log_debug!(WAIT_WITNESS_BUFFER, "WAIT_WITNESS_BUFFER_{}", instance_id);
 
     let state = setup.circom_state.read().unwrap();
     let circom_circuit_ptr = match state.circuit {

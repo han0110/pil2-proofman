@@ -17,6 +17,7 @@ static mut PROOFS_DONE: Option<crossbeam_channel::Sender<(u64, String)>> = None;
 
 extern "C" fn on_proof_done(instance_id: u64, proof_type: *const c_char) {
     let proof_type_str = unsafe { CStr::from_ptr(proof_type).to_string_lossy().into_owned() };
+    tracing::debug!("PROOF_DONE_{} [{}]", instance_id, proof_type_str);
 
     unsafe {
         if let Some(ref tx) = PROOFS_DONE {

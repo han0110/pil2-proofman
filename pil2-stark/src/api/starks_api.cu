@@ -592,7 +592,10 @@ uint64_t gen_proof_gpu(void *pSetupCtx_, uint64_t airgroupId, uint64_t airId, ui
     std::string proofType = "basic";
 
     DeviceCommitBuffers *d_buffers = (DeviceCommitBuffers *)d_buffers_;
+    auto streamWaitStart = std::chrono::steady_clock::now();
     uint32_t streamId = skipRecalculation ? streamId_ : selectStream(d_buffers, airgroupId, airId, proofType, false);
+    uint64_t streamWaitMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - streamWaitStart).count();
+    if (streamWaitMs > 0) zklog.debug("STREAM_WAIT_" + std::to_string(instanceId) + " (" + std::to_string(streamWaitMs) + "ms)");
     if (skipRecalculation) reserveStream(d_buffers, streamId);
     uint32_t gpuId = d_buffers->streamsData[streamId].gpuId;
     uint32_t gpuLocalId = d_buffers->gpus_g2l[gpuId];
@@ -898,7 +901,10 @@ uint64_t gen_recursive_proof_gpu(void *pSetupCtx_, uint64_t airgroupId, uint64_t
     if(string(proofType) == "recursive1" || string(proofType) == "recursive2") {
         aggregation = true;
     }
+    auto streamWaitStart = std::chrono::steady_clock::now();
     uint32_t streamId = selectStream(d_buffers, airgroupId, airId, proofType, aggregation, force_recursive_stream);
+    uint64_t streamWaitMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - streamWaitStart).count();
+    if (streamWaitMs > 0) zklog.debug("STREAM_WAIT_" + std::to_string(instanceId) + " (" + std::to_string(streamWaitMs) + "ms)");
     uint32_t gpuId = d_buffers->streamsData[streamId].gpuId;
     uint32_t gpuLocalId = d_buffers->gpus_g2l[gpuId];
 
@@ -1232,7 +1238,10 @@ uint64_t commit_witness_gpu(void *pSetupCtx_, void *params_, uint64_t instanceId
     SetupCtx *setupCtx = (SetupCtx *)pSetupCtx_;
     StepsParams *params = (StepsParams *)params_;
     DeviceCommitBuffers *d_buffers = (DeviceCommitBuffers *)d_buffers_;
+    auto streamWaitStart = std::chrono::steady_clock::now();
     uint32_t streamId = selectStream(d_buffers, airgroupId, airId, "basic");
+    uint64_t streamWaitMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - streamWaitStart).count();
+    if (streamWaitMs > 0) zklog.debug("STREAM_WAIT_" + std::to_string(instanceId) + " (" + std::to_string(streamWaitMs) + "ms)");
     uint32_t gpuId = d_buffers->streamsData[streamId].gpuId;
     uint32_t gpuLocalId = d_buffers->gpus_g2l[gpuId];
 
@@ -1854,6 +1863,10 @@ void closeStreamTimer(TimerGPU &timer, uint64_t instance_id, uint64_t airgroup_i
         TimerLogCategoryContributionsGPU(timer, STARK_GPU_PROOF);
     else
         TimerLogCategoryContributionsGPU(timer, STARK_GPU_COMMIT);
+    const char *gpuTimerName = isProve ? "STARK_GPU_PROOF" : "STARK_GPU_COMMIT";
+    auto gpuTimerIt = timer.timers.find(gpuTimerName);
+    uint64_t gpuTimeMs = (gpuTimerIt != timer.timers.end() && gpuTimerIt->second.timeMs >= 0.0f) ? (uint64_t)gpuTimerIt->second.timeMs : 0;
+    zklog.debug("GPU_TIME_" + std::to_string(instance_id) + " [" + std::to_string(airgroup_id) + ":" + std::to_string(air_id) + "] (" + std::to_string(gpuTimeMs) + "ms)");
     TimerResetGPU(timer);
 }
 

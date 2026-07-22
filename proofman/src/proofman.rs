@@ -2308,6 +2308,12 @@ where
 
                         match recursive2_proof {
                             Some((p1, p2, p3)) => {
+                                let global_idx = {
+                                    let mut rec2_proofs = recursive2_proofs_ongoing_clone.write().unwrap();
+                                    let global_idx = rec2_proofs.len();
+                                    rec2_proofs.push(None);
+                                    global_idx
+                                };
                                 match gen_witness_aggregation(
                                     &pctx_clone,
                                     &memory_handler_recursive_witness,
@@ -2315,6 +2321,7 @@ where
                                     &p1,
                                     &p2,
                                     &p3,
+                                    global_idx,
                                 ) {
                                     Ok(witness) => Some(witness),
                                     Err(e) => {
@@ -2524,17 +2531,6 @@ where
                 };
 
                 let force_recursive_stream = stream_id >= n_streams_non_recursive;
-                if witness.proof_type == ProofType::Recursive2 {
-                    let id = {
-                        let mut rec2_proofs = recursive2_proofs_ongoing_clone.write().unwrap();
-                        let id = rec2_proofs.len();
-                        rec2_proofs.push(None);
-                        id
-                    };
-
-                    witness.global_idx = Some(id);
-                }
-
                 let new_proof = match gen_recursive_proof_size(&pctx_clone, &setups_clone, &witness) {
                     Ok(p) => p,
                     Err(e) => {
@@ -3240,6 +3236,12 @@ where
                         let p2 = recursive2_airgroup_proofs.pop().unwrap();
                         let p3 = recursive2_airgroup_proofs.pop().unwrap();
 
+                        let global_idx = {
+                            let mut rec2_proofs = recursive2_proofs_ongoing_clone.write().unwrap();
+                            let global_idx = rec2_proofs.len();
+                            rec2_proofs.push(None);
+                            global_idx
+                        };
                         let w = gen_witness_aggregation(
                             &pctx_clone,
                             &memory_handler_recursive_witness,
@@ -3247,6 +3249,7 @@ where
                             &p1,
                             &p2,
                             &p3,
+                            global_idx,
                         );
 
                         let witness = match w {
@@ -3292,14 +3295,7 @@ where
                     Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
                 };
 
-                let id = {
-                    let mut rec2_proofs = recursive2_proofs_ongoing_clone.write().unwrap();
-                    let id = rec2_proofs.len();
-                    rec2_proofs.push(None);
-                    id
-                };
-
-                witness.global_idx = Some(id);
+                let id = witness.global_idx.unwrap();
 
                 let new_proof = match gen_recursive_proof_size(&pctx_clone, &setups_clone, &witness) {
                     Ok(p) => p,
@@ -3495,15 +3491,6 @@ where
                     if cancellation_info_clone.read().unwrap().token.is_cancelled() {
                         break;
                     }
-                    let id = {
-                        let mut rec2_proofs = recursive2_proofs_ongoing_clone.write().unwrap();
-                        let id = rec2_proofs.len();
-                        rec2_proofs.push(None);
-                        id
-                    };
-
-                    witness.global_idx = Some(id);
-
                     let new_proof = match gen_recursive_proof_size(&pctx_clone, &setups_clone, &witness) {
                         Ok(p) => p,
                         Err(e) => {
@@ -3573,6 +3560,12 @@ where
                         let p1 = recursive2_airgroup_proofs.pop().unwrap();
                         let p2 = recursive2_airgroup_proofs.pop().unwrap();
                         let p3 = recursive2_airgroup_proofs.pop().unwrap();
+                        let global_idx = {
+                            let mut rec2_proofs = recursive2_proofs_ongoing_clone.write().unwrap();
+                            let global_idx = rec2_proofs.len();
+                            rec2_proofs.push(None);
+                            global_idx
+                        };
                         let w = gen_witness_aggregation(
                             &pctx_clone,
                             &memory_handler_recursive_witness,
@@ -3580,6 +3573,7 @@ where
                             &p1,
                             &p2,
                             &p3,
+                            global_idx,
                         );
                         let witness = match w {
                             Ok(witness) => witness,
