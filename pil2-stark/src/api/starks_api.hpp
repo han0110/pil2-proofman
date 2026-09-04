@@ -218,10 +218,41 @@ extern "C" {
     void *get_unified_buffer_gpu_for_recursivef(void *d_buffers_, void *d_buffers_recursivef_);
     void load_fixed_pols_recursivef(void *pSetupCtx_, void *pConstTree, void *d_buffers_);
     
-    typedef void (*ProofDoneCallback)(uint64_t instanceId, const char* proofType);
+    // The sections of one proof, resolved on the host at harvest. The first
+    // PROOF_TIMING_GPU_SECTIONS are CUDA event spans on the proof's stream and the indices named
+    // below are the other spans the harvest fills, on a CUDA event or on a C++ clock. The
+    // remaining indices carry host steps, which Rust measures and writes into the record directly.
+    // Field order must match the Rust ProofTiming (repr(C)) it is cast to.
+    #define PROOF_TIMING_SECTIONS 27
+    #define PROOF_TIMING_GPU_SECTIONS 14
+    #define PROOF_TIMING_PROOF_WRITE 14
+    #define PROOF_TIMING_STREAM_WAIT 16
+    #define PROOF_TIMING_ROOT_READBACK 17
+    #define PROOF_TIMING_HARVEST_WAIT 22
+    #define PROOF_TIMING_FFI_PROLOGUE 24
+    #define PROOF_TIMING_PUBLICS_STAGING 25
+    #define PROOF_TIMING_GPU_ENQUEUE_GAP 26
+    struct ProofTiming {
+        double sections[PROOF_TIMING_SECTIONS];
+        uint32_t streamId;
+    };
+
+    // timing is null for a proof with no GPU sections, which is every CPU proof and every
+    // synthesised completion.
+    typedef void (*ProofDoneCallback)(uint64_t instanceId, const char* proofType, const struct ProofTiming* timing);
     
     void register_proof_done_callback(ProofDoneCallback cb);
     void launch_callback(uint64_t instanceId, char *proofType);
+
+    // A contributions commit reports through its own callback: it carries no proof type and its
+    // completion is not a proof-pending decrement, so it must not reach ProofDoneCallback.
+    typedef void (*CommitDoneCallback)(uint64_t instanceId, const struct ProofTiming* timing);
+
+    void register_commit_done_callback(CommitDoneCallback cb);
+
+    // Sections of the last proof harvested with no proof-done callback registered, which is how the
+    // synchronous final proofs report. Zeroed unless streamId is the stream of that harvest.
+    void get_last_proof_timing(uint64_t streamId, struct ProofTiming* timing);
 
     // Backend selection
     // =================================================================================

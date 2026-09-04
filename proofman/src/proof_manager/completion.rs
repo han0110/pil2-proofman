@@ -14,18 +14,43 @@
 //!   C registration; clearing it in `Drop` disconnects the workers' receivers so they exit. Sharing
 //!   only [`Arc<Ledger>`](Ledger), the owner never waits on a worker that is waiting on it.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{unbounded, Receiver};
 use proofman_starks_lib_c::{
     clear_proof_done_callback_c, get_stream_proofs_c, get_stream_proofs_non_blocking_c, register_proof_done_callback_c,
-    CompletionMsg,
+    CompletionMsg, PROOF_TIMING_COMPUTING_WC, PROOF_TIMING_PREPARING_WC, PROOF_TIMING_SECTIONS,
 };
 
+use proofman_common::ProofType;
+
 use crate::CancellationInfo;
+
+/// Record kinds beyond the eight [`ProofType`] variants. A recorder kind is a bare `usize`, so a
+/// host step that is not a STARK proof takes a number of its own and needs no new enum.
+pub const RECORD_KIND_WITNESS: usize = 8;
+pub const RECORD_KIND_COMMIT: usize = 9;
+pub const RECORD_KIND_EXECUTE: usize = 10;
+pub const RECORD_KIND_PRE_CALCULATE: usize = 11;
+pub const RECORD_KIND_CHALLENGE: usize = 12;
+pub const RECORD_KIND_RECOMPUTE: usize = 13;
+pub const RECORD_KIND_RECURSION_WITNESS: usize = 14;
+pub const RECORD_KIND_AGGREGATION_WITNESS: usize = 15;
+
+/// The kinds whose record names one AIR instance. A consumer resolves an air name for these and
+/// leaves it empty for every root step of the contributions phase and every fold.
+pub const RECORD_KIND_PER_INSTANCE: [usize; 7] = [
+    ProofType::Basic as usize,
+    ProofType::Compressor as usize,
+    ProofType::Recursive1 as usize,
+    RECORD_KIND_WITNESS,
+    RECORD_KIND_COMMIT,
+    RECORD_KIND_RECOMPUTE,
+    RECORD_KIND_RECURSION_WITNESS,
+];
 
 /// Poll cadence while draining outstanding units — unchanged from the previous busy-poll wait.
 const POLL_INTERVAL: Duration = Duration::from_micros(100);
@@ -47,6 +72,8 @@ pub struct DeviceCompletions {
     slot: Arc<Mutex<bool>>,
     /// Monotonic id handed to each owner (diagnostics only; see [`Ledger::epoch`]).
     next_epoch: AtomicU64,
+    /// Spans of every epoch this registration opens. Each owner closes its epoch on it.
+    recorder: Arc<ProofRecorder>,
 }
 
 impl Default for DeviceCompletions {
@@ -57,7 +84,11 @@ impl Default for DeviceCompletions {
 
 impl DeviceCompletions {
     pub fn new() -> Self {
-        Self { slot: Arc::new(Mutex::new(false)), next_epoch: AtomicU64::new(1) }
+        Self {
+            slot: Arc::new(Mutex::new(false)),
+            next_epoch: AtomicU64::new(1),
+            recorder: Arc::new(ProofRecorder::new()),
+        }
     }
 
     /// Take the right to receive proof-done completions. Blocks until any previous [`CompletionOwner`]
@@ -75,7 +106,12 @@ impl DeviceCompletions {
         let (tx, rx) = unbounded::<CompletionMsg>();
         register_proof_done_callback_c(tx);
 
-        CompletionOwner { ledger, rx, d_buffers, _slot: slot }
+        CompletionOwner { ledger, rx, d_buffers, recorder: self.recorder(), _slot: slot }
+    }
+
+    /// The recorder every epoch of this registration writes its spans into.
+    pub fn recorder(&self) -> Arc<ProofRecorder> {
+        Arc::clone(&self.recorder)
     }
 }
 
@@ -257,6 +293,8 @@ pub struct CompletionOwner {
     rx: Receiver<CompletionMsg>,
     /// Used by `Drop` to run the final blocking harvest before releasing the registration.
     d_buffers: DeviceBuffersPtr,
+    /// Closed by `Drop`, so a proof of this epoch that never completed leaves no open record.
+    recorder: Arc<ProofRecorder>,
     _slot: SlotToken,
 }
 
@@ -325,9 +363,13 @@ impl Drop for CompletionOwner {
             );
         }
 
-        // (3) Release the registration. This drops the sole sender, so every receiver clone
-        //     disconnects and its worker loop exits — no sentinel needed.
+        // (3) Drop the sole sender, so every receiver clone disconnects and its worker loop exits,
+        //     with no sentinel needed. The C++ callback pointer outlives this, and only a caller
+        //     that has joined every launcher and harvester may null it.
         clear_proof_done_callback_c();
+
+        // (4) Nothing can close the records this epoch left open, so drop them.
+        self.recorder.close_epoch();
     }
 }
 
@@ -361,12 +403,234 @@ impl Drop for ProofToken {
     }
 }
 
+/// One proof's span, in milliseconds from the [`ProofRecorder`] origin. `id` is the instance id for
+/// a basic, a compressor, and a recursive1 proof, and the ongoing index for a recursive2 proof.
+/// `start_ms` rounds down and `end_ms` rounds up, so the bar covers the whole span and a span under
+/// one millisecond survives. `breakdown_ms` holds the sections of the proof, and is all zero when
+/// none is reported.
+#[derive(Clone, Debug)]
+pub struct ProofRecord {
+    pub id: u64,
+    pub proof_type: usize,
+    pub airgroup_id: usize,
+    pub air_id: usize,
+    pub stream_id: u32,
+    pub start_ms: u32,
+    pub end_ms: u32,
+    pub breakdown_ms: [u32; PROOF_TIMING_SECTIONS],
+}
+
+/// Per-proof spans for one prove job, spanning every completion epoch the job opens. A launch opens
+/// a record keyed like a [`Ledger`] unit, its completion closes it, and [`Self::take`] hands the
+/// closed ones over with the age of the origin they are offset from. A record whose proof never
+/// completes is dropped when [`CompletionOwner`] releases its epoch, so it cannot pin the origin.
+pub struct ProofRecorder {
+    /// Zero of every offset. Moves to the present only on a [`Self::take`] that finds nothing in
+    /// flight, so a caller that leaves proofs running keeps the origin its successor needs.
+    origin: Mutex<Instant>,
+    /// Each open record beside the stamp its launch was taken at, which is where the head a callee
+    /// closes starts. The record itself carries only offsets, which are too coarse for a head.
+    open: Mutex<HashMap<UnitKey, (Instant, ProofRecord)>>,
+    done: Mutex<Vec<ProofRecord>>,
+}
+
+impl Default for ProofRecorder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ProofRecorder {
+    pub fn new() -> Self {
+        Self { origin: Mutex::new(Instant::now()), open: Mutex::new(HashMap::new()), done: Mutex::new(Vec::new()) }
+    }
+
+    /// Open a record for a proof about to be launched. `stream_id` is `u32::MAX` on the CPU backend,
+    /// which carries no stream.
+    pub fn record_launch(&self, id: u64, kind: usize, airgroup_id: usize, air_id: usize, stream_id: u32) {
+        self.record_launch_at(id, kind, airgroup_id, air_id, stream_id, Instant::now());
+    }
+
+    /// Open a record that started at `launch`, which a witness build opens once it is done, from
+    /// its first buffer take. The origin lock is held across the insert, so a concurrent
+    /// [`Self::take`] cannot move the origin the start offset was taken from.
+    pub fn record_launch_at(
+        &self,
+        id: u64,
+        kind: usize,
+        airgroup_id: usize,
+        air_id: usize,
+        stream_id: u32,
+        launch: Instant,
+    ) {
+        let origin = self.origin.lock().unwrap_or_else(|p| p.into_inner());
+        let start_ms = start_offset_ms(*origin, launch);
+        let record = ProofRecord {
+            id,
+            proof_type: kind,
+            airgroup_id,
+            air_id,
+            stream_id,
+            start_ms,
+            end_ms: start_ms,
+            breakdown_ms: [0; PROOF_TIMING_SECTIONS],
+        };
+        self.open.lock().unwrap_or_else(|p| p.into_inner()).insert((id, kind), (launch, record));
+    }
+
+    /// Close the record of a completed proof. A completion with no open record is a no-op, which is
+    /// what a peer proof the aggregation service injects, and a proof of a previous take, report.
+    pub fn record_completion(&self, id: u64, kind: usize, breakdown_ms: [u32; PROOF_TIMING_SECTIONS]) {
+        self.record_completion_at(id, kind, breakdown_ms, Instant::now());
+    }
+
+    /// Close the record of a completed proof at the stamp the reporter took. The report crosses a
+    /// channel to its consumer, and a commit is drained in one batch at the end of its phase, so the
+    /// call time is not the time the work ended.
+    pub fn record_completion_at(&self, id: u64, kind: usize, breakdown_ms: [u32; PROOF_TIMING_SECTIONS], at: Instant) {
+        let origin = self.origin.lock().unwrap_or_else(|p| p.into_inner());
+        let end_ms = end_offset_ms(*origin, at);
+        let record = self.open.lock().unwrap_or_else(|p| p.into_inner()).remove(&(id, kind));
+        if let Some((_, mut record)) = record {
+            record.end_ms = end_ms;
+            merge_sections(&mut record.breakdown_ms, breakdown_ms);
+            self.done.lock().unwrap_or_else(|p| p.into_inner()).push(record);
+        }
+    }
+
+    /// Record one section of a proof still in flight, measured on the launcher thread from `start`.
+    /// A proof with no open record is a no-op, like [`Self::record_completion`].
+    pub fn record_section(&self, id: u64, kind: usize, index: usize, start: Instant) {
+        self.record_section_us(id, kind, index, start.elapsed().as_micros() as u64);
+    }
+
+    /// Record one section already measured in microseconds, which is how a wait accumulated over
+    /// several calls arrives. See [`Self::record_section`].
+    pub fn record_section_us(&self, id: u64, kind: usize, index: usize, micros: u64) {
+        let ms = section_ms(micros);
+        if let Some((_, record)) = self.open.lock().unwrap_or_else(|p| p.into_inner()).get_mut(&(id, kind)) {
+            record.breakdown_ms[index] = ms;
+        }
+    }
+
+    /// Record the head of a launch, from the stamp [`Self::record_launch`] took to `at`. The step
+    /// that ends the head runs in a callee holding no stamp of the launch, and the open record does.
+    pub fn record_launch_section(&self, id: u64, kind: usize, index: usize, at: Instant) {
+        if let Some((launch, record)) = self.open.lock().unwrap_or_else(|p| p.into_inner()).get_mut(&(id, kind)) {
+            record.breakdown_ms[index] = section_ms(at.saturating_duration_since(*launch).as_micros() as u64);
+        }
+    }
+
+    /// Merge the sections a synchronous harvest reports into the record of a proof still in flight.
+    /// A proof with no open record is a no-op, like [`Self::record_completion`].
+    pub fn record_sections(&self, id: u64, kind: usize, breakdown_ms: [u32; PROOF_TIMING_SECTIONS]) {
+        if let Some((_, record)) = self.open.lock().unwrap_or_else(|p| p.into_inner()).get_mut(&(id, kind)) {
+            merge_sections(&mut record.breakdown_ms, breakdown_ms);
+        }
+    }
+
+    /// Record a witness build as one span from `start`, with its two sections in microseconds. The
+    /// span opens at the first buffer take of the build, so the queue for a buffer stays outside the
+    /// bar.
+    pub fn record_build(
+        &self,
+        id: u64,
+        kind: usize,
+        airgroup_id: usize,
+        air_id: usize,
+        start: Instant,
+        preparing_us: u64,
+        computing_us: u64,
+    ) {
+        self.record_launch_at(id, kind, airgroup_id, air_id, u32::MAX, start);
+        self.record_section_us(id, kind, PROOF_TIMING_PREPARING_WC, preparing_us);
+        self.record_section_us(id, kind, PROOF_TIMING_COMPUTING_WC, computing_us);
+        self.record_completion(id, kind, [0; PROOF_TIMING_SECTIONS]);
+    }
+
+    /// Record a step that never reaches a completion callback, closed over `start`. A root step of
+    /// the contributions phase carries no instance, and a witness build carries the one it feeds.
+    pub fn record_span(&self, id: u64, kind: usize, airgroup_id: usize, air_id: usize, start: Instant) {
+        let origin = self.origin.lock().unwrap_or_else(|p| p.into_inner());
+        let record = ProofRecord {
+            id,
+            proof_type: kind,
+            airgroup_id,
+            air_id,
+            stream_id: u32::MAX,
+            start_ms: start_offset_ms(*origin, start),
+            end_ms: end_offset_ms(*origin, Instant::now()),
+            breakdown_ms: [0; PROOF_TIMING_SECTIONS],
+        };
+        self.done.lock().unwrap_or_else(|p| p.into_inner()).push(record);
+    }
+
+    /// Drop every record still open at the end of a completion epoch. The registration that could
+    /// close them is gone, and one such record would hold the origin for the life of the process.
+    pub fn close_epoch(&self) {
+        self.open.lock().unwrap_or_else(|p| p.into_inner()).clear();
+    }
+
+    /// Drain the closed records and report the age of the origin their offsets are taken from.
+    pub fn take(&self) -> (Vec<ProofRecord>, u64) {
+        let mut origin = self.origin.lock().unwrap_or_else(|p| p.into_inner());
+        let now = Instant::now();
+        let age_ms = end_offset_ms(*origin, now) as u64;
+        let idle = self.open.lock().unwrap_or_else(|p| p.into_inner()).is_empty();
+        let records = std::mem::take(&mut *self.done.lock().unwrap_or_else(|p| p.into_inner()));
+        if idle {
+            *origin = now;
+        }
+        (records, age_ms)
+    }
+}
+
+/// The start of a span, rounded down, so the bar never starts after the work it holds.
+fn start_offset_ms(origin: Instant, at: Instant) -> u32 {
+    at.saturating_duration_since(origin).as_millis() as u32
+}
+
+/// The end of a span, rounded up, so the bar never ends before the work it holds and a span of any
+/// positive length keeps one millisecond instead of collapsing onto its own start.
+fn end_offset_ms(origin: Instant, at: Instant) -> u32 {
+    at.saturating_duration_since(origin).as_nanos().div_ceil(1_000_000) as u32
+}
+
+/// Round a host span the way the C++ harvest rounds the sections it reports, so a step under one
+/// millisecond does not collapse to zero on one side and survive on the other.
+fn section_ms(micros: u64) -> u32 {
+    (micros as f64 / 1000.0).round() as u32
+}
+
+/// Merge instead of assign. A section the launcher measured must survive the zero the completion
+/// reports for it.
+fn merge_sections(slots: &mut [u32; PROOF_TIMING_SECTIONS], breakdown_ms: [u32; PROOF_TIMING_SECTIONS]) {
+    for (slot, ms) in slots.iter_mut().zip(breakdown_ms) {
+        if ms != 0 {
+            *slot = ms;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proofman_common::{BufferPool, TimedBufferPool};
+    use proofman_fields::Goldilocks;
+    use proofman_starks_lib_c::{PROOF_TIMING_LAUNCH_PROLOGUE, PROOF_TIMING_PREPARING_WC, PROOF_TIMING_WITNESS_EXPANSION};
 
     const BASIC: usize = 0;
     const RECURSIVE1: usize = 2;
+
+    /// A pool whose every take waits, standing in for a trace pool with no free buffer.
+    struct SlowPool;
+
+    impl BufferPool<Goldilocks> for SlowPool {
+        fn take_buffer(&self) -> Vec<Goldilocks> {
+            std::thread::sleep(Duration::from_millis(5));
+            Vec::new()
+        }
+    }
 
     /// A CPU-backend owner: a null device pointer makes `Drop`'s harvest a no-op, so these tests
     /// exercise the ledger without touching the GPU.
@@ -471,5 +735,225 @@ mod tests {
         drop(first);
         let second = completions.acquire(null);
         assert!(second.epoch() > epoch, "each owner gets a fresh epoch");
+    }
+
+    #[test]
+    fn records_keep_their_order_and_take_empties_the_recorder() {
+        let recorder = ProofRecorder::new();
+        recorder.record_launch(7, BASIC, 0, 1, 3);
+        recorder.record_launch(7, RECURSIVE1, 0, 1, 4);
+        recorder.record_completion(7, RECURSIVE1, [1; PROOF_TIMING_SECTIONS]);
+        recorder.record_completion(7, BASIC, [0; PROOF_TIMING_SECTIONS]);
+
+        let (records, age_ms) = recorder.take();
+        let kinds: Vec<usize> = records.iter().map(|r| r.proof_type).collect();
+        assert_eq!(kinds, vec![RECURSIVE1, BASIC], "records keep the order they completed in");
+        let launches: Vec<_> = records.iter().map(|r| (r.id, r.airgroup_id, r.air_id, r.stream_id)).collect();
+        assert_eq!(launches, vec![(7, 0, 1, 4), (7, 0, 1, 3)], "each record keeps the identity of its launch");
+        let breakdowns: Vec<_> = records.iter().map(|r| r.breakdown_ms).collect();
+        assert_eq!(
+            breakdowns,
+            vec![[1; PROOF_TIMING_SECTIONS], [0; PROOF_TIMING_SECTIONS]],
+            "each record keeps the breakdown of its completion"
+        );
+        assert!(records.iter().all(|r| r.start_ms <= r.end_ms), "a span never ends before it starts");
+        assert!(records.iter().all(|r| r.end_ms as u64 <= age_ms), "no record ends after the origin age");
+        assert!(recorder.take().0.is_empty(), "take drains the recorder");
+    }
+
+    #[test]
+    fn releasing_the_epoch_drops_an_open_record() {
+        let completions = DeviceCompletions::new();
+        let recorder = completions.recorder();
+        let owner = completions.acquire(DeviceBuffersPtr(std::ptr::null_mut()));
+        recorder.record_launch(1, BASIC, 0, 0, 0);
+        std::thread::sleep(Duration::from_millis(5));
+        drop(owner);
+
+        let (records, age_ms) = recorder.take();
+        assert!(records.is_empty(), "a proof that never completed is not reported");
+        assert!(recorder.take().1 < age_ms, "the dropped record no longer holds the origin");
+    }
+
+    #[test]
+    fn the_origin_holds_while_a_record_stays_open() {
+        let recorder = ProofRecorder::new();
+        recorder.record_launch(1, BASIC, 0, 0, 0);
+        recorder.record_launch(2, BASIC, 0, 0, 1);
+        recorder.record_completion(1, BASIC, [0; PROOF_TIMING_SECTIONS]);
+
+        let (first, first_age) = recorder.take();
+        assert_eq!(first.len(), 1, "an open record is not handed over");
+        std::thread::sleep(Duration::from_millis(5));
+
+        recorder.record_completion(2, BASIC, [0; PROOF_TIMING_SECTIONS]);
+        let (second, second_age) = recorder.take();
+        assert_eq!(second.len(), 1);
+        assert!(second_age > first_age, "the origin stayed put, so its age kept growing");
+        assert!(second[0].start_ms <= first[0].end_ms, "the second record is offset from the same origin");
+
+        // Nothing is open now, so the origin moved and the next age starts from zero again.
+        recorder.record_launch(3, BASIC, 0, 0, 0);
+        recorder.record_completion(3, BASIC, [0; PROOF_TIMING_SECTIONS]);
+        let (third, third_age) = recorder.take();
+        assert_eq!(third.len(), 1);
+        assert!(third_age < second_age, "the origin moved once no record was open");
+    }
+
+    #[test]
+    fn a_launcher_section_survives_the_completion() {
+        let recorder = ProofRecorder::new();
+        recorder.record_launch(9, RECURSIVE1, 0, 0, 2);
+        let expansion_start = Instant::now();
+        std::thread::sleep(Duration::from_millis(5));
+        recorder.record_section(9, RECURSIVE1, PROOF_TIMING_WITNESS_EXPANSION, expansion_start);
+        recorder.record_section(9, BASIC, PROOF_TIMING_WITNESS_EXPANSION, expansion_start);
+
+        let mut breakdown = [0; PROOF_TIMING_SECTIONS];
+        breakdown[0] = 7;
+        recorder.record_completion(9, RECURSIVE1, breakdown);
+
+        let (records, _) = recorder.take();
+        assert_eq!(records.len(), 1, "a section for a proof with no open record is dropped");
+        assert_eq!(records[0].breakdown_ms[0], 7, "the completion fills the sections it reports");
+        assert!(
+            records[0].breakdown_ms[PROOF_TIMING_WITNESS_EXPANSION] >= 5,
+            "the completion's zero does not erase a section the launcher measured"
+        );
+    }
+
+    #[test]
+    fn the_head_of_a_launch_is_measured_from_the_record_it_opened() {
+        let recorder = ProofRecorder::new();
+        recorder.record_launch(4, BASIC, 0, 0, 1);
+        std::thread::sleep(Duration::from_millis(5));
+        recorder.record_launch_section(4, BASIC, PROOF_TIMING_LAUNCH_PROLOGUE, Instant::now());
+        recorder.record_launch_section(4, RECURSIVE1, PROOF_TIMING_LAUNCH_PROLOGUE, Instant::now());
+        recorder.record_completion(4, BASIC, [0; PROOF_TIMING_SECTIONS]);
+
+        let (records, _) = recorder.take();
+        assert_eq!(records.len(), 1, "a head for a proof with no open record is dropped");
+        assert!(
+            records[0].breakdown_ms[PROOF_TIMING_LAUNCH_PROLOGUE] >= 5,
+            "the head runs from the launch the record opened, which no callee stamps"
+        );
+    }
+
+    #[test]
+    fn a_span_keeps_the_identity_it_is_given() {
+        let recorder = ProofRecorder::new();
+        let start = Instant::now();
+        recorder.record_span(0, RECORD_KIND_CHALLENGE, 0, 0, start);
+        recorder.record_span(137, RECORD_KIND_WITNESS, 2, 5, start);
+        recorder.record_span(4, RECORD_KIND_AGGREGATION_WITNESS, 0, 0, start);
+
+        let (records, _) = recorder.take();
+        let identities: Vec<_> = records.iter().map(|r| (r.id, r.proof_type, r.airgroup_id, r.air_id)).collect();
+        assert_eq!(
+            identities,
+            vec![
+                (0, RECORD_KIND_CHALLENGE, 0, 0),
+                (137, RECORD_KIND_WITNESS, 2, 5),
+                (4, RECORD_KIND_AGGREGATION_WITNESS, 0, 0)
+            ],
+            "a root step carries no instance and a witness carries the one it feeds"
+        );
+        assert!(records.iter().all(|r| r.stream_id == u32::MAX), "a span runs on no stream of its own");
+        assert!(
+            RECORD_KIND_PER_INSTANCE.contains(&RECORD_KIND_WITNESS)
+                && !RECORD_KIND_PER_INSTANCE.contains(&RECORD_KIND_CHALLENGE)
+                && !RECORD_KIND_PER_INSTANCE.contains(&RECORD_KIND_AGGREGATION_WITNESS),
+            "only the kinds that name an instance resolve an air name"
+        );
+    }
+
+    #[test]
+    fn a_drained_completion_closes_at_the_stamp_it_reports() {
+        let recorder = ProofRecorder::new();
+        recorder.record_launch(3, RECORD_KIND_COMMIT, 0, 0, u32::MAX);
+        let harvested_at = Instant::now();
+        std::thread::sleep(Duration::from_millis(20));
+
+        let mut breakdown = [0; PROOF_TIMING_SECTIONS];
+        breakdown[1] = 4;
+        recorder.record_completion_at(3, RECORD_KIND_COMMIT, breakdown, harvested_at);
+
+        let (records, _) = recorder.take();
+        assert_eq!(records.len(), 1);
+        assert!(records[0].end_ms < 20, "the record closes when the harvest reported, not when the drain ran");
+        assert_eq!(records[0].breakdown_ms[1], 4, "the drained completion still fills its sections");
+    }
+
+    #[test]
+    fn a_synchronous_harvest_merges_its_sections_without_closing() {
+        let recorder = ProofRecorder::new();
+        recorder.record_launch(0, RECORD_KIND_EXECUTE, 0, 0, u32::MAX);
+        let mut harvested = [0; PROOF_TIMING_SECTIONS];
+        harvested[2] = 9;
+        recorder.record_sections(0, RECORD_KIND_EXECUTE, harvested);
+        assert!(recorder.take().0.is_empty(), "merging sections leaves the record open");
+
+        recorder.record_completion(0, RECORD_KIND_EXECUTE, [0; PROOF_TIMING_SECTIONS]);
+        let (records, _) = recorder.take();
+        assert_eq!(records[0].breakdown_ms[2], 9, "the merged sections survive the close");
+    }
+
+    #[test]
+    fn a_section_under_a_millisecond_rounds_the_way_the_harvest_rounds() {
+        let recorder = ProofRecorder::new();
+        recorder.record_launch(1, RECORD_KIND_RECOMPUTE, 0, 0, u32::MAX);
+        recorder.record_section_us(1, RECORD_KIND_RECOMPUTE, PROOF_TIMING_PREPARING_WC, 600);
+        recorder.record_completion(1, RECORD_KIND_RECOMPUTE, [0; PROOF_TIMING_SECTIONS]);
+
+        let (records, _) = recorder.take();
+        assert_eq!(records[0].breakdown_ms[PROOF_TIMING_PREPARING_WC], 1, "0.6 ms rounds up, as the harvest does");
+    }
+
+    #[test]
+    fn a_span_under_a_millisecond_keeps_one_millisecond() {
+        let origin = Instant::now();
+        let at = origin + Duration::from_micros(1400);
+        assert_eq!(start_offset_ms(origin, at), 1, "the start rounds down");
+        assert_eq!(end_offset_ms(origin, at), 2, "the end rounds up");
+        assert_eq!(end_offset_ms(origin, origin), 0, "an empty span stays empty");
+
+        let recorder = ProofRecorder::new();
+        let start = Instant::now();
+        std::thread::sleep(Duration::from_micros(100));
+        recorder.record_span(0, RECORD_KIND_CHALLENGE, 0, 0, start);
+
+        let (records, age_ms) = recorder.take();
+        assert!(records[0].end_ms > records[0].start_ms, "a step of any positive length keeps its bar");
+        assert!(records[0].end_ms as u64 <= age_ms, "the bar still ends inside the window it is offset from");
+    }
+
+    #[test]
+    fn the_buffer_pool_stamps_a_take_on_another_thread_and_counts_the_later_waits() {
+        // The dispatch loop takes its buffers on a leased pool, never on the owning thread.
+        let pool = TimedBufferPool::new(&SlowPool);
+        assert!(pool.acquired_at().is_none(), "no take, no stamp");
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let _ = BufferPool::<Goldilocks>::take_buffer(&pool);
+            });
+        });
+        let acquired = pool.acquired_at().expect("the first take stamps the pool");
+        assert_eq!(pool.later_waited_us(), 0, "the first wait stays outside the record");
+
+        let _ = BufferPool::<Goldilocks>::take_buffer(&pool);
+        assert!(pool.later_waited_us() >= 5_000, "a later wait accumulates");
+        assert_eq!(pool.acquired_at(), Some(acquired), "a later take keeps the stamp");
+    }
+
+    #[test]
+    fn a_record_opened_late_starts_at_its_stamp() {
+        let recorder = ProofRecorder::new();
+        let start = Instant::now();
+        std::thread::sleep(Duration::from_millis(5));
+        recorder.record_launch_at(3, RECORD_KIND_WITNESS, 0, 0, u32::MAX, start);
+        recorder.record_completion(3, RECORD_KIND_WITNESS, [0; PROOF_TIMING_SECTIONS]);
+
+        let (records, _) = recorder.take();
+        assert!(records[0].end_ms - records[0].start_ms >= 5, "the bar spans from the stamp");
     }
 }

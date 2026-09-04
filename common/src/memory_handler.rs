@@ -1,9 +1,9 @@
 use crossbeam_channel::{bounded, Sender, Receiver};
 use std::collections::HashSet;
 use std::ffi::c_void;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 use crossbeam_queue::SegQueue;
 use crate::ProofCtx;
 use proofman_fields::PrimeField64;
@@ -409,6 +409,47 @@ where
 impl<F: PrimeField64 + Send + Sync + 'static> BufferPool<F> for MemoryHandler<F> {
     fn take_buffer(&self) -> Vec<F> {
         self.take_buffer()
+    }
+}
+
+/// A pool that stamps the first buffer take of one build and accumulates the wait of every later
+/// take. A buffer is taken on whichever worker of the leased rayon pool runs the dispatch, so a
+/// thread-local stamp would miss it. The record of the build opens at the first take, which keeps
+/// the queue for a buffer outside its bar, and the later waits fall inside it.
+pub struct TimedBufferPool<'a, F: PrimeField64 + Send + Sync + 'static> {
+    inner: &'a dyn BufferPool<F>,
+    acquired: Mutex<Option<Instant>>,
+    later_waited_us: AtomicU64,
+}
+
+impl<'a, F: PrimeField64 + Send + Sync + 'static> TimedBufferPool<'a, F> {
+    pub fn new(inner: &'a dyn BufferPool<F>) -> Self {
+        Self { inner, acquired: Mutex::new(None), later_waited_us: AtomicU64::new(0) }
+    }
+
+    /// When the first take returned, none before it.
+    pub fn acquired_at(&self) -> Option<Instant> {
+        *self.acquired.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Microseconds waited for every buffer after the first.
+    pub fn later_waited_us(&self) -> u64 {
+        self.later_waited_us.load(Ordering::Relaxed)
+    }
+}
+
+impl<F: PrimeField64 + Send + Sync + 'static> BufferPool<F> for TimedBufferPool<'_, F> {
+    fn take_buffer(&self) -> Vec<F> {
+        let start = Instant::now();
+        let buffer = self.inner.take_buffer();
+        let mut acquired = self.acquired.lock().unwrap_or_else(|p| p.into_inner());
+        match *acquired {
+            None => *acquired = Some(Instant::now()),
+            Some(_) => {
+                self.later_waited_us.fetch_add(start.elapsed().as_micros() as u64, Ordering::Relaxed);
+            }
+        }
+        buffer
     }
 }
 

@@ -14,26 +14,42 @@ use std::ffi::CString;
 use std::ffi::CStr;
 
 /// A proof-done completion crossing the FFI boundary: the `(id, proof_type)` the C++ harvest
-/// reports for a finished proof.
+/// reports for a finished proof, plus the GPU sections it measured and the instant it reported
+/// them. `breakdown_ms` is all zero for a completion that carries no timing, which is every CPU
+/// proof and every synthesised completion. The stamp travels with the message because the consumer
+/// reads it off a channel, after the proof ended.
 #[derive(Debug, Clone)]
 pub struct CompletionMsg {
     pub id: u64,
     pub proof_type: String,
+    pub breakdown_ms: [u32; PROOF_TIMING_SECTIONS],
+    pub at: std::time::Instant,
 }
 
 // Read by `on_proof_done` (C++/CUDA harvest threads), written by register/clear. The C++ callback
-// pointer is never nulled, so a late harvest can race a `clear`; the RwLock keeps read-vs-drop
-// exclusive so a send can't drop/free the channel mid-send -> SEGV (status=11).
+// pointer outlives the `clear`, so every harvest of the closing epoch still lands here, and the
+// RwLock keeps read-vs-drop exclusive so a send can't drop/free the channel mid-send -> SEGV
+// (status=11).
 static PROOFS_DONE: std::sync::RwLock<Option<crossbeam_channel::Sender<CompletionMsg>>> = std::sync::RwLock::new(None);
 
-extern "C" fn on_proof_done(instance_id: u64, proof_type: *const c_char) {
+extern "C" fn on_proof_done(instance_id: u64, proof_type: *const c_char, timing: *const ProofTiming) {
+    let at = std::time::Instant::now();
     let proof_type_str = unsafe { CStr::from_ptr(proof_type).to_string_lossy().into_owned() };
+
+    // The struct is owned by the harvest frame, so copy it out before the send.
+    let mut breakdown_ms = [0u32; PROOF_TIMING_SECTIONS];
+    if !timing.is_null() {
+        let sections = unsafe { (*timing).sections };
+        for (slot, ms) in breakdown_ms.iter_mut().zip(sections.iter()) {
+            *slot = ms.round() as u32;
+        }
+    }
 
     // Hold the read lock across the send so a concurrent `clear` can't drop the Sender mid-send.
     // Recover from poison rather than unwind: an unwind out of an `extern "C"` fn aborts.
     let guard = PROOFS_DONE.read().unwrap_or_else(|e| e.into_inner());
     if let Some(ref tx) = *guard {
-        let _ = tx.send(CompletionMsg { id: instance_id, proof_type: proof_type_str });
+        let _ = tx.send(CompletionMsg { id: instance_id, proof_type: proof_type_str, breakdown_ms, at });
     }
 }
 
@@ -44,6 +60,59 @@ pub fn register_proof_done_callback_c(tx: crossbeam_channel::Sender<CompletionMs
     unsafe {
         register_proof_done_callback(Some(on_proof_done));
     }
+}
+
+/// A contributions commit crossing the FFI boundary: the instance the C++ harvest reports, the
+/// sections it measured, and the instant it reported them. The stamp travels with the message
+/// because the drain runs at the end of the phase, long after the commit ended.
+#[derive(Debug, Clone)]
+pub struct CommitMsg {
+    pub id: u64,
+    pub breakdown_ms: [u32; PROOF_TIMING_SECTIONS],
+    pub at: std::time::Instant,
+}
+
+// Same lock discipline as PROOFS_DONE: this C++ callback pointer is never nulled, so the RwLock is
+// what keeps a late harvest from sending into a Sender a concurrent clear is dropping.
+static COMMITS_DONE: std::sync::RwLock<Option<crossbeam_channel::Sender<CommitMsg>>> = std::sync::RwLock::new(None);
+
+extern "C" fn on_commit_done(instance_id: u64, timing: *const ProofTiming) {
+    let at = std::time::Instant::now();
+
+    // The struct is owned by the harvest frame, so copy it out before the send.
+    let mut breakdown_ms = [0u32; PROOF_TIMING_SECTIONS];
+    if !timing.is_null() {
+        let sections = unsafe { (*timing).sections };
+        for (slot, ms) in breakdown_ms.iter_mut().zip(sections.iter()) {
+            *slot = ms.round() as u32;
+        }
+    }
+
+    let guard = COMMITS_DONE.read().unwrap_or_else(|e| e.into_inner());
+    if let Some(ref tx) = *guard {
+        let _ = tx.send(CommitMsg { id: instance_id, breakdown_ms, at });
+    }
+}
+
+pub fn register_commit_done_callback_c(tx: crossbeam_channel::Sender<CommitMsg>) {
+    *COMMITS_DONE.write().unwrap_or_else(|e| e.into_inner()) = Some(tx);
+    unsafe {
+        register_commit_done_callback(Some(on_commit_done));
+    }
+}
+
+/// The sections of the last proof harvested with no proof-done callback registered. Reported only
+/// for `stream_id`, so a harvest of another stream cannot be read as this proof's.
+pub fn get_last_proof_timing_c(stream_id: u64) -> [u32; PROOF_TIMING_SECTIONS] {
+    let mut timing = ProofTiming { sections: [0.0; PROOF_TIMING_SECTIONS], streamId: u32::MAX };
+    unsafe {
+        get_last_proof_timing(stream_id, &mut timing);
+    }
+    let mut breakdown_ms = [0u32; PROOF_TIMING_SECTIONS];
+    for (slot, ms) in breakdown_ms.iter_mut().zip(timing.sections.iter()) {
+        *slot = ms.round() as u32;
+    }
+    breakdown_ms
 }
 
 pub fn compute_const_tree_c(
@@ -130,8 +199,18 @@ pub fn launch_callback_c(instance_id: u64, proof_type: &str) {
 
 pub fn clear_proof_done_callback_c() {
     // Take the write lock so the Sender is dropped only when no `on_proof_done` holds the read lock
-    // mid-send. A late harvest after clearing just observes `None` (the C++ pointer is never nulled).
+    // mid-send. A harvest already past the C++ null check just observes `None`.
     *PROOFS_DONE.write().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// Null the C++ callback pointer, which makes a later harvest stash its sections instead, and is how
+/// the synchronous final proofs read them back through [`get_last_proof_timing_c`]. The store is
+/// unsynchronised against the harvest that reads the pointer, so the caller runs it only once every
+/// thread that can launch or harvest a proof has been joined.
+pub fn unregister_proof_done_callback_c() {
+    unsafe {
+        register_proof_done_callback(None);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -438,7 +438,9 @@ void genProof_gpu(SetupCtx& setupCtx, gl64_t *d_aux_trace, gl64_t *d_const_pols,
     TimerStopCategoryGPU(timer, FRI);
     TimerStopGPU(timer, STARK_STEP_FRI);
 
+    TimerStartGPU(timer, STARK_PROOF_READBACK);
     setProof(setupCtx, (Goldilocks::Element *)d_aux_trace, (Goldilocks::Element *)d_const_tree, proof_buffer_pinned, stream);
+    TimerStopGPU(timer, STARK_PROOF_READBACK);
 
     TimerStopGPU(timer, STARK_GPU_PROOF);
 }

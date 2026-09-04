@@ -363,6 +363,9 @@ struct StreamData{
     // trace H2D. Distinct from end_event (the whole commit): the buffer can be recycled as soon
     // as the copy is done, and gating that on the LDE/Merkle work kept the pool starved.
     cudaEvent_t trace_copy_event;
+    // Recorded when a harvest takes this stream. The stream is drained by then, so the span from
+    // end_event is the wait between the proof finishing and its harvest.
+    cudaEvent_t harvest_event;
     TimerGPU timer;
 
     TranscriptGL_GPU *transcript;
@@ -391,6 +394,12 @@ struct StreamData{
     int64_t instanceId;
     string proofType;
     uint64_t arity;
+    // Host wait for this stream inside selectStream, reported as a proof section at harvest.
+    uint64_t streamWaitUs = 0;
+    // Host head of the launch, before the first stream event of the proof.
+    uint64_t ffiPrologueUs = 0;
+    // Span from end_event to the harvest of this stream, filled by collectStreamResult.
+    double harvestWaitMs = 0.0;
 
     // Which fixed columns this stream's aux trace holds, not which air it last served: airs
     // with identical fixed share a const-pols slot, so the offset is the key. constAggBuffer
@@ -432,6 +441,7 @@ struct StreamData{
         recursive = recursive_;
         cudaEventCreate(&end_event);
         cudaEventCreate(&trace_copy_event);
+        cudaEventCreate(&harvest_event);
         instanceId = -1;
         status = 0;
         CHECKCUDAERR(cudaMallocHost((void **)&pinned_buffer_proof, max_size_proof * sizeof(Goldilocks::Element)));
@@ -478,12 +488,15 @@ struct StreamData{
         cudaSetDevice(gpuId);
         // end_event / trace_copy_event are created once in initialize() and destroyed in free();
         // cudaEventRecord overwrites them on each use, so there is no need to
-        // destroy/recreate them on every per-instance reset.
+        // destroy/recreate them on every per-instance reset. harvest_event is the same.
         status = reset_status ? 0 : 3;
 
         root = nullptr;
         pSetupCtx = nullptr;
         proofBuffer = nullptr;
+        streamWaitUs = 0;
+        ffiPrologueUs = 0;
+        harvestWaitMs = 0.0;
 
         // Clear stale open timer categories: a cancel mid-category leaves one open, and the next
         // job's stopCategory then mismatches and CHECKCUDAERR-aborts. Host-side only, no CUDA calls.
@@ -531,6 +544,7 @@ struct StreamData{
         cudaStreamDestroy(stream);
         cudaEventDestroy(end_event);
         cudaEventDestroy(trace_copy_event);
+        cudaEventDestroy(harvest_event);
         cudaFreeHost(pinned_buffer_proof);
         cudaFreeHost(pinned_buffer_exps_params);
         cudaFreeHost(pinned_buffer_exps_args);

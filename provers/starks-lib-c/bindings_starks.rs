@@ -739,6 +739,10 @@ extern "C" {
     
     pub fn launch_callback(instanceId: u64, proofType: *mut ::std::os::raw::c_char);
 
+    pub fn register_commit_done_callback(cb: CommitDoneCallback);
+
+    pub fn get_last_proof_timing(streamId: u64, timing: *mut ProofTiming);
+
     // MPI calls
     // ========================================================================================
     pub fn initialize_agg_readiness_tracker();
@@ -748,5 +752,32 @@ extern "C" {
 }
 
 // Type definitions
-pub type ProofDoneCallback =
-    ::std::option::Option<unsafe extern "C" fn(instanceId: u64, proofType: *const ::std::os::raw::c_char)>;
+/// The sections of one proof or one contributions commit, mirroring the `PROOF_TIMING_*` defines of
+/// `pil2-stark/src/api/starks_api.hpp`. The C++ harvest fills the CUDA event spans and its own
+/// clocks; the indices below name every section the Rust launcher writes into the record itself,
+/// which the record merge keeps over the zero a harvest reports for it.
+pub const PROOF_TIMING_SECTIONS: usize = 27;
+/// Position of `STARK_COMMIT_LDE_MERKLE` in the `proofTimingSections` table of `starks_api.cu`. A
+/// contribution committed on a streaming slot runs synchronously and reaches no harvest, so the
+/// launcher fills this one itself.
+pub const PROOF_TIMING_COMMIT_LDE_MERKLE: usize = 13;
+pub const PROOF_TIMING_WITNESS_EXPANSION: usize = 15;
+pub const PROOF_TIMING_CIRCOM_WITNESS: usize = 18;
+pub const PROOF_TIMING_PREPARING_WC: usize = 19;
+pub const PROOF_TIMING_COMPUTING_WC: usize = 20;
+pub const PROOF_TIMING_RELOAD_FIXED_POLS: usize = 21;
+pub const PROOF_TIMING_LAUNCH_PROLOGUE: usize = 23;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ProofTiming {
+    pub sections: [f64; PROOF_TIMING_SECTIONS],
+    pub streamId: u32,
+}
+
+pub type ProofDoneCallback = ::std::option::Option<
+    unsafe extern "C" fn(instanceId: u64, proofType: *const ::std::os::raw::c_char, timing: *const ProofTiming),
+>;
+
+pub type CommitDoneCallback =
+    ::std::option::Option<unsafe extern "C" fn(instanceId: u64, timing: *const ProofTiming)>;

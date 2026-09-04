@@ -806,6 +806,7 @@ void load_device_const_pols_gpu(uint64_t airgroupId, uint64_t airId, uint64_t in
 
 uint64_t gen_proof_gpu(void *pSetupCtx_, uint64_t airgroupId, uint64_t airId, uint64_t instanceId, void *params_, void *globalChallenge, uint64_t* proofBuffer, char *proofFile, void *d_buffers_, bool skipRecalculation, uint64_t streamId_, char *constPolsPath,  char *constTreePath, char *customCommitsFixedPath, bool selfContained) {
 
+    auto ffiStart = std::chrono::steady_clock::now();
     auto key = std::make_pair(airgroupId, airId);
     std::string proofType = "basic";
 
@@ -878,19 +879,32 @@ uint64_t gen_proof_gpu(void *pSetupCtx_, uint64_t airgroupId, uint64_t airId, ui
     uint64_t offsetStage1Extended = setupCtx->starkInfo.mapOffsets[std::make_pair("cm1", true)];
     uint64_t offsetPublicInputs = setupCtx->starkInfo.mapOffsets[std::make_pair("publics", false)];
 
+    // Host head of the launch, which ends where the first stream event of this proof starts. The
+    // internal selectStream spin runs inside it and reports itself, so take that off the head.
+    uint64_t headUs = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - ffiStart).count();
+    sd.ffiPrologueUs = headUs > sd.streamWaitUs ? headUs - sd.streamWaitUs : 0;
+
+    // Umbrella over the whole enqueue: what it holds beyond the sections inside it is device idle.
+    TimerStartGPU(timer, STARK_GPU_ENQUEUE);
+    TimerStartGPU(timer, STARK_LOAD_CUSTOM_COMMITS);
     if (setupCtx->starkInfo.mapTotalNCustomCommitsFixed > 0 && !reuse_custom_fixed) {
         Goldilocks::Element *pCustomCommitsFixed = (Goldilocks::Element *)d_aux_trace + setupCtx->starkInfo.mapOffsets[std::make_pair("custom_fixed", false)];
         uint64_t customCommitsSize = setupCtx->starkInfo.mapTotalNCustomCommitsFixed * sizeof(Goldilocks::Element);
         // Skip the 32-byte Merkle-root header at the start of the file (assumes 1 custom commit per AIR).
         load_and_copy_to_device_in_chunks(d_buffers, customCommitsFixedPath, (uint8_t*)pCustomCommitsFixed, customCommitsSize, streamId, 32);
     }
+    TimerStopGPU(timer, STARK_LOAD_CUSTOM_COMMITS);
 
+    TimerStartGPU(timer, STARK_TRACE_UPLOAD);
     if (!skipRecalculation) {
         uint64_t total_size = (d_buffers->packedTrace && air_instance_info->is_packed) ? air_instance_info->num_packed_words * N * sizeof(Goldilocks::Element) : N * nCols * sizeof(Goldilocks::Element);
         uint64_t *dst = (uint64_t *)(d_aux_trace + offsetStage1Extended);
         copy_to_device_in_chunks(d_buffers, params->trace, dst, total_size, streamId, timer);
     }
+    TimerStopGPU(timer, STARK_TRACE_UPLOAD);
     
+    TimerStartGPU(timer, STARK_PUBLICS_STAGING);
     size_t totalCopySize = 0;
     totalCopySize += setupCtx->starkInfo.nPublics;
     totalCopySize += setupCtx->starkInfo.proofValuesSize;
@@ -924,9 +938,11 @@ uint64_t gen_proof_gpu(void *pSetupCtx_, uint64_t airgroupId, uint64_t airId, ui
     memcpy(aux_values + offset, (Goldilocks::Element *)globalChallenge, FIELD_EXTENSION * sizeof(Goldilocks::Element));
 
     CHECKCUDAERR(cudaMemcpyAsync((uint8_t*)(d_aux_trace + offsetPublicInputs), aux_values, totalCopySize * sizeof(Goldilocks::Element), cudaMemcpyHostToDevice, stream));
+    TimerStopGPU(timer, STARK_PUBLICS_STAGING);
 
     gl64_t *d_const_pols = d_buffers->d_constPols[gpuLocalId] + air_instance_info->const_pols_offset;
     gl64_t *d_const_tree;
+    TimerStartGPU(timer, STARK_LOAD_CONST_TREE);
     if (air_instance_info->stored_tree) {
         // Preallocated in the const buffer, so it is in place unconditionally.
         d_const_tree = d_buffers->d_constPols[gpuLocalId] + air_instance_info->const_tree_offset;
@@ -941,6 +957,7 @@ uint64_t gen_proof_gpu(void *pSetupCtx_, uint64_t airgroupId, uint64_t airId, ui
             load_and_copy_to_device_in_chunks(d_buffers, constTreePath, (uint8_t*)d_const_tree, sizeConstTree, streamId);
         }
     }
+    TimerStopGPU(timer, STARK_LOAD_CONST_TREE);
     sd.constTreeResident = true;
 
 
@@ -949,6 +966,7 @@ uint64_t gen_proof_gpu(void *pSetupCtx_, uint64_t airgroupId, uint64_t airId, ui
     // calculateFixedExtended merkelize, and a slot claimed by commit_witness has pols but no
     // tree. Costs a redundant unpack in exactly that case.
     genProof_gpu(*setupCtx, d_aux_trace, d_const_pols, d_const_tree, constTreePath, streamId, instanceId, d_buffers, air_instance_info, skipRecalculation, timer, stream, selfContained, reuse_const_tree);
+    TimerStopGPU(timer, STARK_GPU_ENQUEUE);
     cudaEventRecord(sd.end_event, stream);
     sd.status = 2;
     return streamId;
@@ -1108,6 +1126,45 @@ void verify_constraints_gpu(void *pSetupCtx_, uint64_t airgroupId, uint64_t airI
     d_buffers->streamsData[streamId].status = 2;
 }
 
+// Milliseconds of one stream-timer section, or zero for a name this stream never opened.
+static double timerSectionMs(TimerGPU &timer, const char *name) {
+    const string section(name);
+    return timer.timers.count(section) ? timer.getTimeMs(section) : 0.0;
+}
+
+// The GPU sections of ProofTiming, in index order. They do not nest, so their sum is the part of
+// the proof they account for. STARK_LOAD_CUSTOM_COMMITS through STARK_LOAD_CONST_TREE bracket a
+// device span that holds the host step only on an idle stream, and only the first starts idle.
+// The last two fire on a contributions commit only; a name the stream timer never saw reads zero.
+// STARK_PUBLICS_STAGING is a stream section too, but its index sits past this block.
+static const char *const proofTimingSections[PROOF_TIMING_GPU_SECTIONS] = {
+    "STARK_STEP_0",
+    "STARK_COMMIT_STAGE_1",
+    "STARK_CALCULATE_WITNESS_STD",
+    "CALCULATE_IM_POLS",
+    "STARK_COMMIT_STAGE_2",
+    "STARK_STEP_Q",
+    "STARK_STEP_EVALS",
+    "STARK_STEP_FRI",
+    "STARK_LOAD_CUSTOM_COMMITS",
+    "STARK_TRACE_UPLOAD",
+    "STARK_LOAD_CONST_TREE",
+    "STARK_PROOF_READBACK",
+    "STARK_TRACE_UNPACK",
+    "STARK_COMMIT_LDE_MERKLE",
+};
+
+// Device idle inside one enqueue: the umbrella event pair brackets every GPU section of the
+// record, so what it holds beyond their sum belongs to no section.
+static double enqueueGapMs(TimerGPU &timer, const char *umbrella, const ProofTiming &timing) {
+    double sectionsMs = timing.sections[PROOF_TIMING_PUBLICS_STAGING];
+    for (uint32_t i = 0; i < PROOF_TIMING_GPU_SECTIONS; i++) {
+        sectionsMs += timing.sections[i];
+    }
+    const double umbrellaMs = timerSectionMs(timer, umbrella);
+    return umbrellaMs > sectionsMs ? umbrellaMs - sectionsMs : 0.0;
+}
+
 void get_proof(DeviceCommitBuffers *d_buffers, uint64_t streamId) {
     SetupCtx *setupCtx = (SetupCtx*) d_buffers->streamsData[streamId].pSetupCtx;
     uint64_t airgroupId = d_buffers->streamsData[streamId].airgroupId;
@@ -1118,17 +1175,48 @@ void get_proof(DeviceCommitBuffers *d_buffers, uint64_t streamId) {
     string proofFile = d_buffers->streamsData[streamId].proofFile;
     TimerGPU &timer = d_buffers->streamsData[streamId].timer;
 
+    // Read the sections before closeStreamTimer clears the per-stream timer.
+    ProofTiming timing = {};
+    timing.streamId = (uint32_t)streamId;
+    for (uint32_t i = 0; i < PROOF_TIMING_GPU_SECTIONS; i++) {
+        timing.sections[i] = timerSectionMs(timer, proofTimingSections[i]);
+    }
+    timing.sections[PROOF_TIMING_PUBLICS_STAGING] = timerSectionMs(timer, "STARK_PUBLICS_STAGING");
+    timing.sections[PROOF_TIMING_GPU_ENQUEUE_GAP] = enqueueGapMs(timer, "STARK_GPU_ENQUEUE", timing);
+
     closeStreamTimer(timer, instanceId, airgroupId, airId, true);
 
+    auto writeStart = std::chrono::steady_clock::now();
     writeProof(*setupCtx, d_buffers->streamsData[streamId].pinned_buffer_proof, proofBuffer, airgroupId, airId, instanceId, proofFile);
 
+    // Host work of the harvest itself, which no stream event covers.
+    timing.sections[PROOF_TIMING_PROOF_WRITE] =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - writeStart).count();
+    timing.sections[PROOF_TIMING_STREAM_WAIT] = d_buffers->streamsData[streamId].streamWaitUs / 1000.0;
+    timing.sections[PROOF_TIMING_FFI_PROLOGUE] = d_buffers->streamsData[streamId].ffiPrologueUs / 1000.0;
+    timing.sections[PROOF_TIMING_HARVEST_WAIT] = d_buffers->streamsData[streamId].harvestWaitMs;
+
     if (proof_done_callback != nullptr) {
-        proof_done_callback(instanceId, proofType.c_str());
+        proof_done_callback(instanceId, proofType.c_str(), &timing);
+    } else {
+        // The synchronous final proofs run with the callback cleared, so stash the sections for the
+        // launcher to read back through get_last_proof_timing.
+        last_proof_timing = timing;
     }
 }
 
 static void collectStreamResult(DeviceCommitBuffers *d_buffers, uint64_t streamId) {
     StreamData &sd = d_buffers->streamsData[streamId];
+    // The stream is drained here, so this event fires at once and its span from end_event is the
+    // wait the proof spent holding the stream after it finished.
+    cudaEventRecord(sd.harvest_event, sd.stream);
+    float harvestWaitMs = 0.0f;
+    if (cudaEventSynchronize(sd.harvest_event) != cudaSuccess ||
+        cudaEventElapsedTime(&harvestWaitMs, sd.end_event, sd.harvest_event) != cudaSuccess) {
+        cudaGetLastError();   // clear sticky error
+        harvestWaitMs = 0.0f; // don't propagate garbage
+    }
+    sd.harvestWaitMs = harvestWaitMs;
     bool commitRoot = sd.root != nullptr;
     if (commitRoot) {
         get_commit_root(d_buffers, streamId);
@@ -1203,6 +1291,7 @@ void get_stream_id_proof_gpu(void *d_buffers_, uint64_t streamId) {
 
 uint64_t gen_recursive_proof_gpu(void *pSetupCtx_, uint64_t airgroupId, uint64_t airId, uint64_t instanceId, void *trace, void *aux_trace, void *pConstPols, void *pConstTree, void *pPublicInputs, uint64_t* proofBuffer, char *proof_file, bool vadcop, void *d_buffers_, char *constPolsPath, char *constTreePath, char *proofType, bool force_recursive_stream, char *recurser_id, uint64_t streamId_)
 {
+    auto ffiStart = std::chrono::steady_clock::now();
     DeviceCommitBuffers *d_buffers = (DeviceCommitBuffers *)d_buffers_;
     bool aggregation = false;
     if(string(proofType) == "recursive1" || string(proofType) == "recursive2") {
@@ -1252,8 +1341,20 @@ uint64_t gen_recursive_proof_gpu(void *pSetupCtx_, uint64_t airgroupId, uint64_t
     sd.witnessResident = false;
 
     uint64_t offsetStage1Extended = setupCtx->starkInfo.mapOffsets[std::make_pair("cm1", true)];
+
+    // Host head of the launch, which ends where the first stream event of this proof starts. The
+    // internal selectStream spin runs inside it and reports itself, so take that off the head.
+    uint64_t headUs = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - ffiStart).count();
+    sd.ffiPrologueUs = headUs > sd.streamWaitUs ? headUs - sd.streamWaitUs : 0;
+
+    // Umbrella over the whole enqueue: what it holds beyond the sections inside it is device idle.
+    TimerStartGPU(timer, STARK_GPU_ENQUEUE);
+    TimerStartGPU(timer, STARK_TRACE_UPLOAD);
     copy_to_device_in_chunks(d_buffers, trace, (uint8_t*)(d_aux_trace + offsetStage1Extended), sizeTrace, streamId, timer);
+    TimerStopGPU(timer, STARK_TRACE_UPLOAD);
     
+    TimerStartGPU(timer, STARK_PUBLICS_STAGING);
     uint64_t offsetPublicInputs = setupCtx->starkInfo.mapOffsets[std::make_pair("publics", false)];
     // Stage publics into the per-stream pinned region for an async copy (no stream
     // sync); reuse gated by end_event on stream reselect. Runtime check survives NDEBUG.
@@ -1265,9 +1366,11 @@ uint64_t gen_recursive_proof_gpu(void *pSetupCtx_, uint64_t airgroupId, uint64_t
     Goldilocks::Element *pinned_publics = d_buffers->streamsData[streamId].pinned_aux_values;
     memcpy(pinned_publics, pPublicInputs, setupCtx->starkInfo.nPublics * sizeof(Goldilocks::Element));
     CHECKCUDAERR(cudaMemcpyAsync((uint8_t*)(d_aux_trace + offsetPublicInputs), pinned_publics, setupCtx->starkInfo.nPublics * sizeof(Goldilocks::Element), cudaMemcpyHostToDevice, stream));
+    TimerStopGPU(timer, STARK_PUBLICS_STAGING);
 
     gl64_t *d_const_pols = d_buffers->d_constPolsAggregation[gpuLocalId] + air_instance_info->const_pols_offset;
     gl64_t *d_const_tree;
+    TimerStartGPU(timer, STARK_LOAD_CONST_TREE);
     if (air_instance_info->stored_tree) {
         // Preallocated in the const buffer, so it is in place unconditionally.
         d_const_tree = d_buffers->d_constPolsAggregation[gpuLocalId] + air_instance_info->const_tree_offset;
@@ -1280,10 +1383,12 @@ uint64_t gen_recursive_proof_gpu(void *pSetupCtx_, uint64_t airgroupId, uint64_t
             load_and_copy_to_device_in_chunks(d_buffers, constTreePath, (uint8_t*)d_const_tree, sizeConstTree, streamId);
         }
     }
+    TimerStopGPU(timer, STARK_LOAD_CONST_TREE);
     sd.constTreeResident = true;
 
     // See gen_proof_gpu: the tree-aware flag, not the slot one.
     genProof_gpu(*setupCtx, d_aux_trace, d_const_pols, d_const_tree, constTreePath, streamId, instanceId, d_buffers, air_instance_info, false, timer, stream, true, reuse_const_tree);
+    TimerStopGPU(timer, STARK_GPU_ENQUEUE);
     cudaEventRecord(d_buffers->streamsData[streamId].end_event, stream);
     d_buffers->streamsData[streamId].status = 2;
     return streamId;
@@ -1574,6 +1679,7 @@ void *gen_recursive_proof_final_gpu(void *pSetupCtx_, uint64_t airgroupId, uint6
 }
 
 uint64_t commit_witness_gpu(void *pSetupCtx_, void *params_, uint64_t instanceId, uint64_t airgroupId, uint64_t airId, void *root, void *d_buffers_, char *customCommitsFixedPath) {
+    auto ffiStart = std::chrono::steady_clock::now();
     SetupCtx *setupCtx = (SetupCtx *)pSetupCtx_;
     StepsParams *params = (StepsParams *)params_;
     DeviceCommitBuffers *d_buffers = (DeviceCommitBuffers *)d_buffers_;
@@ -1612,6 +1718,13 @@ uint64_t commit_witness_gpu(void *pSetupCtx_, void *params_, uint64_t instanceId
 
     cudaStream_t stream = d_buffers->streamsData[streamId].stream;
     TimerGPU &timer = d_buffers->streamsData[streamId].timer;
+
+    // Host head of the launch, which ends where the first stream event of this commit starts. The
+    // internal selectStream spin runs inside it and reports itself, so take that off the head.
+    uint64_t headUs = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - ffiStart).count();
+    sd.ffiPrologueUs = headUs > sd.streamWaitUs ? headUs - sd.streamWaitUs : 0;
+
     TimerStartGPU(timer, STARK_GPU_COMMIT);
 
 #ifdef USE_CUDA_GRAPH
@@ -1633,7 +1746,9 @@ uint64_t commit_witness_gpu(void *pSetupCtx_, void *params_, uint64_t instanceId
     uint64_t offsetStage1Extended = setupCtx->starkInfo.mapOffsets[std::make_pair("cm1", true)];
     uint64_t total_size = (d_buffers->packedTrace && air_instance_info->is_packed) ? air_instance_info->num_packed_words * N * sizeof(Goldilocks::Element) : sizeTrace;
     uint64_t *dst = (uint64_t*)(d_aux_trace + offsetStage1Extended);
+    TimerStartGPU(timer, STARK_TRACE_UPLOAD);
     copy_to_device_in_chunks(d_buffers, params->trace, dst, total_size, streamId, timer);
+    TimerStopGPU(timer, STARK_TRACE_UPLOAD);
     PROOFMAN_SUMCHECK("contrib_before_unpack", dst, total_size / sizeof(uint64_t), stream);
 
     uint64_t tree_size = MerkleTreeGL::getTreeNumElements(NExtended, arity);
@@ -1645,11 +1760,13 @@ uint64_t commit_witness_gpu(void *pSetupCtx_, void *params_, uint64_t instanceId
     Goldilocks::Element *pNodes = (Goldilocks::Element*)d_aux_trace + offset_mt;
     NTTGoldilocksGPU ntt;
 
+    TimerStartGPU(timer, STARK_TRACE_UNPACK);
     if (d_buffers->packedTrace && air_instance_info->is_packed) {
         unpack_trace(air_instance_info, (uint64_t *)(d_aux_trace + offset_dst), (uint64_t *)(d_aux_trace + offset_src), nCols, N, stream, timer);
     } else {
         fromRowMajorToColMajor(N, nCols, (gl64_t *)(d_aux_trace + offset_dst), (gl64_t *)(d_aux_trace + offset_src), resolveLayout(nBits, nCols), stream);
     }
+    TimerStopGPU(timer, STARK_TRACE_UNPACK);
     PROOFMAN_SUMCHECK("contrib_after_unpack", d_aux_trace + offset_src, N * nCols, stream);
 
     uint64_t nWitnessHints = setupCtx->expressionsBin.getNumberHintIdsByName("witness_calc");
@@ -1748,7 +1865,9 @@ uint64_t commit_witness_gpu(void *pSetupCtx_, void *params_, uint64_t instanceId
             CHECKCUDAERR(cudaMemcpyAsync(d_params, params_pinned, sizeof(StepsParams), cudaMemcpyHostToDevice, stream));
             calculateWitnessExpr_gpu(*setupCtx, h_params, d_params, air_instance_info->expressions_gpu, d_expsArgs, d_destParams, pinned_exps_params, pinned_exps_args, countId, timer, stream);
         };
+        TimerStartGPU(timer, STARK_CALCULATE_WITNESS_STD);
         cudagraph::run(cudagraph::key(0x57455843ULL ^ witnessCtxId), countId, stream, witnessExprBody);
+        TimerStopGPU(timer, STARK_CALCULATE_WITNESS_STD);
     }
 
     PROOFMAN_SUMCHECK("contrib_before_lde", d_aux_trace + offset_src, N * nCols, stream);
@@ -1763,7 +1882,9 @@ uint64_t commit_witness_gpu(void *pSetupCtx_, void *params_, uint64_t instanceId
         CHECKCUDAERR(cudaMemcpyAsync(d_buffers->streamsData[streamId].pinned_buffer_proof, &pNodes[tree_size - HASH_SIZE], HASH_SIZE * sizeof(uint64_t), cudaMemcpyDeviceToHost, stream));
     };
     uint64_t commitLdeCountId = 0;   // no expression launches in this body; dummy cursor
+    TimerStartGPU(timer, STARK_COMMIT_LDE_MERKLE);
     cudagraph::run(cudagraph::key(0x574c4445ULL ^ witnessCtxId), commitLdeCountId, stream, commitLdeBody);
+    TimerStopGPU(timer, STARK_COMMIT_LDE_MERKLE);
     PROOFMAN_SUMCHECK("contrib_after_lde", d_aux_trace + offset_dst, NExtended * nCols, stream);
     TimerStopGPU(timer, STARK_GPU_COMMIT);
     cudaEventRecord(d_buffers->streamsData[streamId].end_event, stream);
@@ -1773,14 +1894,35 @@ uint64_t commit_witness_gpu(void *pSetupCtx_, void *params_, uint64_t instanceId
 
 void get_commit_root(DeviceCommitBuffers *d_buffers, uint64_t streamId) {
 
+    auto readbackStart = std::chrono::steady_clock::now();
     Goldilocks::Element *root = (Goldilocks::Element *)d_buffers->streamsData[streamId].root;
     memcpy((Goldilocks::Element *)root, d_buffers->streamsData[streamId].pinned_buffer_proof, HASH_SIZE * sizeof(uint64_t));
+    double rootReadbackMs =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - readbackStart).count();
     uint64_t instanceId = d_buffers->streamsData[streamId].instanceId;
     uint64_t airgroupId = d_buffers->streamsData[streamId].airgroupId;
     uint64_t airId = d_buffers->streamsData[streamId].airId;
-    closeStreamTimer(d_buffers->streamsData[streamId].timer, instanceId, airgroupId, airId, false);
+    TimerGPU &timer = d_buffers->streamsData[streamId].timer;
+
+    // Read the sections before closeStreamTimer clears the per-stream timer.
+    ProofTiming timing = {};
+    timing.streamId = (uint32_t)streamId;
+    for (uint32_t i = 0; i < PROOF_TIMING_GPU_SECTIONS; i++) {
+        timing.sections[i] = timerSectionMs(timer, proofTimingSections[i]);
+    }
+    timing.sections[PROOF_TIMING_GPU_ENQUEUE_GAP] = enqueueGapMs(timer, "STARK_GPU_COMMIT", timing);
+    timing.sections[PROOF_TIMING_ROOT_READBACK] = rootReadbackMs;
+    timing.sections[PROOF_TIMING_STREAM_WAIT] = d_buffers->streamsData[streamId].streamWaitUs / 1000.0;
+    timing.sections[PROOF_TIMING_FFI_PROLOGUE] = d_buffers->streamsData[streamId].ffiPrologueUs / 1000.0;
+    timing.sections[PROOF_TIMING_HARVEST_WAIT] = d_buffers->streamsData[streamId].harvestWaitMs;
+
+    closeStreamTimer(timer, instanceId, airgroupId, airId, false);
     // Contributions commit_root does NOT fire proof_done_callback: that decrement is owned by the
     // Prove-path accounting, and firing it here could hit the NULL-callback window and wedge proofs_pending.
+    // A separate registration reports the commit instead, and it touches no proof accounting.
+    if (commit_done_callback != nullptr) {
+        commit_done_callback(instanceId, &timing);
+    }
 }
 
 void init_gpu_setup_gpu(uint64_t arity) {
@@ -2645,9 +2787,16 @@ uint32_t reserve_best_stream_scan(DeviceCommitBuffers* d_buffers, uint64_t airgr
 // Blocking wrapper: retry the scan until a stream is reserved. Used by the paths that
 // select internally (contributions/commit/setup, and one-off recursive launches).
 uint32_t selectStream(DeviceCommitBuffers* d_buffers, uint64_t airgroupId, uint64_t airId, std::string proofType, bool recursive, bool force_recursive){
+    auto waitStart = std::chrono::steady_clock::now();
     for (uint64_t spins = 0;; ++spins) {
+        // The wait runs to the reservation, not to the last failed pass: the pass that succeeds can
+        // harvest the predecessor parked on the stream, and this launch pays for that harvest.
         uint32_t s = reserve_best_stream_scan(d_buffers, airgroupId, airId, proofType, recursive, force_recursive);
-        if (s != UINT32_MAX) return s;
+        if (s != UINT32_MAX) {
+            d_buffers->streamsData[s].streamWaitUs = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - waitStart).count();
+            return s;
+        }
         // Two very different causes spin here: no stream is large enough (permanent -- this would
         // spin forever), or every eligible stream is merely busy (transient, and a sign the class is
         // under-provisioned). Reported once; both keep retrying.
