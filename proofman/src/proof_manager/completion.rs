@@ -15,17 +15,41 @@
 //!   only [`Arc<Ledger>`](Ledger), the owner never waits on a worker that is waiting on it.
 
 use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::Duration;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crossbeam_channel::{unbounded, Receiver};
 use proofman_starks_lib_c::{
     clear_proof_done_callback_c, get_stream_proofs_c, get_stream_proofs_non_blocking_c, register_proof_done_callback_c,
     CompletionMsg,
 };
+use proofman_starks_lib_c::{PROOF_TIMING_COMPUTING_WC, PROOF_TIMING_PREPARING_WC, PROOF_TIMING_SECTIONS};
+
+use proofman_common::ProofType;
 
 use crate::CancellationInfo;
+
+pub const RECORD_KIND_WITNESS: usize = 8;
+pub const RECORD_KIND_COMMIT: usize = 9;
+pub const RECORD_KIND_EXECUTE: usize = 10;
+pub const RECORD_KIND_PRE_CALCULATE: usize = 11;
+pub const RECORD_KIND_CHALLENGE: usize = 12;
+pub const RECORD_KIND_RECOMPUTE: usize = 13;
+pub const RECORD_KIND_RECURSION_WITNESS: usize = 14;
+pub const RECORD_KIND_AGGREGATION_WITNESS: usize = 15;
+
+pub const RECORD_KIND_PER_INSTANCE: [usize; 7] = [
+    ProofType::Basic as usize,
+    ProofType::Compressor as usize,
+    ProofType::Recursive1 as usize,
+    RECORD_KIND_WITNESS,
+    RECORD_KIND_COMMIT,
+    RECORD_KIND_RECOMPUTE,
+    RECORD_KIND_RECURSION_WITNESS,
+];
 
 /// Poll cadence while draining outstanding units — unchanged from the previous busy-poll wait.
 const POLL_INTERVAL: Duration = Duration::from_micros(100);
@@ -371,12 +395,265 @@ impl Drop for ProofToken {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct ProofRecord {
+    pub id: u64,
+    pub proof_type: usize,
+    pub airgroup_id: usize,
+    pub air_id: usize,
+    pub stream_id: u32,
+    pub start_ms: u64,
+    pub end_ms: u64,
+    pub breakdown_ms: [u32; PROOF_TIMING_SECTIONS],
+}
+
+pub struct ProofRecorder {
+    origin: Mutex<(Instant, u64)>,
+    open: Mutex<HashMap<UnitKey, (Instant, ProofRecord)>>,
+    done: Mutex<Vec<ProofRecord>>,
+    job: AtomicU64,
+    reserved: Mutex<(u64, u64)>,
+    stash: Mutex<HashMap<usize, (Instant, Instant)>>,
+}
+
+impl Default for ProofRecorder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ProofRecorder {
+    pub fn new() -> Self {
+        Self {
+            origin: Mutex::new((Instant::now(), unix_ms())),
+            open: Mutex::new(HashMap::new()),
+            done: Mutex::new(Vec::new()),
+            job: AtomicU64::new(0),
+            reserved: Mutex::new((u64::MAX, 0)),
+            stash: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn record_launch(&self, id: u64, kind: usize, airgroup_id: usize, air_id: usize, stream_id: u32) {
+        self.record_launch_at(id, kind, airgroup_id, air_id, stream_id, Instant::now());
+    }
+
+    pub fn record_launch_at(
+        &self,
+        id: u64,
+        kind: usize,
+        airgroup_id: usize,
+        air_id: usize,
+        stream_id: u32,
+        launch: Instant,
+    ) {
+        let origin = self.origin.lock().unwrap_or_else(|p| p.into_inner());
+        let start_ms = origin.1 + start_offset_ms(origin.0, launch) as u64;
+        let record = ProofRecord {
+            id,
+            proof_type: kind,
+            airgroup_id,
+            air_id,
+            stream_id,
+            start_ms,
+            end_ms: start_ms,
+            breakdown_ms: [0; PROOF_TIMING_SECTIONS],
+        };
+        self.open.lock().unwrap_or_else(|p| p.into_inner()).insert((id, kind), (launch, record));
+    }
+
+    pub fn record_completion(&self, id: u64, kind: usize, breakdown_ms: [u32; PROOF_TIMING_SECTIONS]) {
+        self.record_completion_at(id, kind, breakdown_ms, Instant::now());
+    }
+
+    pub fn record_completion_at(&self, id: u64, kind: usize, breakdown_ms: [u32; PROOF_TIMING_SECTIONS], at: Instant) {
+        let origin = self.origin.lock().unwrap_or_else(|p| p.into_inner());
+        let end_ms = origin.1 + end_offset_ms(origin.0, at) as u64;
+        let record = self.open.lock().unwrap_or_else(|p| p.into_inner()).remove(&(id, kind));
+        if let Some((_, mut record)) = record {
+            record.end_ms = end_ms;
+            merge_sections(&mut record.breakdown_ms, breakdown_ms);
+            self.push(record);
+        }
+    }
+
+    pub fn record_section(&self, id: u64, kind: usize, index: usize, start: Instant) {
+        self.record_section_us(id, kind, index, start.elapsed().as_micros() as u64);
+    }
+
+    pub fn record_section_us(&self, id: u64, kind: usize, index: usize, micros: u64) {
+        let ms = section_ms(micros);
+        if let Some((_, record)) = self.open.lock().unwrap_or_else(|p| p.into_inner()).get_mut(&(id, kind)) {
+            record.breakdown_ms[index] = ms;
+        }
+    }
+
+    pub fn record_launch_section(&self, id: u64, kind: usize, index: usize, at: Instant) {
+        if let Some((launch, record)) = self.open.lock().unwrap_or_else(|p| p.into_inner()).get_mut(&(id, kind)) {
+            record.breakdown_ms[index] = section_ms(at.saturating_duration_since(*launch).as_micros() as u64);
+        }
+    }
+
+    pub fn record_sections(&self, id: u64, kind: usize, breakdown_ms: [u32; PROOF_TIMING_SECTIONS]) {
+        if let Some((_, record)) = self.open.lock().unwrap_or_else(|p| p.into_inner()).get_mut(&(id, kind)) {
+            merge_sections(&mut record.breakdown_ms, breakdown_ms);
+        }
+    }
+
+    pub fn record_build(&self, id: u64, kind: usize, airgroup_id: usize, air_id: usize, span: (Instant, u64, u64)) {
+        let (start, preparing_us, computing_us) = span;
+        self.record_launch_at(id, kind, airgroup_id, air_id, u32::MAX, start);
+        self.record_section_us(id, kind, PROOF_TIMING_PREPARING_WC, preparing_us);
+        self.record_section_us(id, kind, PROOF_TIMING_COMPUTING_WC, computing_us);
+        self.record_completion(id, kind, [0; PROOF_TIMING_SECTIONS]);
+    }
+
+    pub fn record_span(&self, id: u64, kind: usize, airgroup_id: usize, air_id: usize, start: Instant) {
+        self.record_span_at(id, kind, airgroup_id, air_id, start, Instant::now());
+    }
+
+    pub fn stash_span(&self, key: usize, start: Instant) {
+        self.stash.lock().unwrap_or_else(|p| p.into_inner()).insert(key, (start, Instant::now()));
+    }
+
+    pub fn record_stashed_span(&self, key: usize, id: u64, kind: usize, airgroup_id: usize, air_id: usize) {
+        let span = self.stash.lock().unwrap_or_else(|p| p.into_inner()).remove(&key);
+        if let Some((start, end)) = span {
+            self.record_span_at(id, kind, airgroup_id, air_id, start, end);
+        }
+    }
+
+    fn record_span_at(&self, id: u64, kind: usize, airgroup_id: usize, air_id: usize, start: Instant, end: Instant) {
+        let origin = self.origin.lock().unwrap_or_else(|p| p.into_inner());
+        let record = ProofRecord {
+            id,
+            proof_type: kind,
+            airgroup_id,
+            air_id,
+            stream_id: u32::MAX,
+            start_ms: origin.1 + start_offset_ms(origin.0, start) as u64,
+            end_ms: origin.1 + end_offset_ms(origin.0, end) as u64,
+            breakdown_ms: [0; PROOF_TIMING_SECTIONS],
+        };
+        self.push(record);
+    }
+
+    fn push(&self, mut record: ProofRecord) {
+        let (base, span) = *self.reserved.lock().unwrap_or_else(|p| p.into_inner());
+        if is_fold(record.proof_type) && record.id >= base {
+            record.id += span;
+        }
+        self.done.lock().unwrap_or_else(|p| p.into_inner()).push(record);
+    }
+
+    pub fn close_epoch(&self) {
+        self.open.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        self.stash.lock().unwrap_or_else(|p| p.into_inner()).clear();
+    }
+
+    pub fn reset(&self) {
+        self.close_epoch();
+        self.done.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        *self.origin.lock().unwrap_or_else(|p| p.into_inner()) = (Instant::now(), unix_ms());
+    }
+
+    pub fn next_job(&self) {
+        self.job.fetch_add(1, Ordering::Relaxed);
+        *self.reserved.lock().unwrap_or_else(|p| p.into_inner()) = (u64::MAX, 0);
+    }
+
+    pub fn take(&self) -> Vec<ProofRecord> {
+        std::mem::take(&mut *self.done.lock().unwrap_or_else(|p| p.into_inner()))
+    }
+
+    pub fn export(&self) -> Vec<u64> {
+        let mut words = vec![self.job.load(Ordering::Relaxed)];
+        for r in self.take() {
+            words.extend([r.id, r.proof_type as u64, r.airgroup_id as u64, r.air_id as u64, r.stream_id as u64]);
+            words.extend([r.start_ms, r.end_ms]);
+            words.extend(r.breakdown_ms.map(u64::from));
+        }
+        words
+    }
+
+    pub fn import(&self, words: &[u64]) -> bool {
+        if words[0] != self.job.load(Ordering::Relaxed) {
+            return false;
+        }
+        let mut done = self.done.lock().unwrap_or_else(|p| p.into_inner());
+        let offset = done.iter().filter(|r| is_fold(r.proof_type)).map(|r| r.id + 1).max().unwrap_or(0);
+        let mut end = offset;
+        for w in words[1..].chunks_exact(7 + PROOF_TIMING_SECTIONS) {
+            let id = if is_fold(w[1] as usize) { w[0] + offset } else { w[0] };
+            if is_fold(w[1] as usize) {
+                end = end.max(id + 1);
+            }
+            done.push(ProofRecord {
+                id,
+                proof_type: w[1] as usize,
+                airgroup_id: w[2] as usize,
+                air_id: w[3] as usize,
+                stream_id: w[4] as u32,
+                start_ms: w[5],
+                end_ms: w[6],
+                breakdown_ms: std::array::from_fn(|i| w[7 + i] as u32),
+            });
+        }
+        drop(done);
+        if end > offset {
+            let mut reserved = self.reserved.lock().unwrap_or_else(|p| p.into_inner());
+            *reserved = (reserved.0.min(offset), reserved.1 + end - offset);
+        }
+        true
+    }
+}
+
+fn is_fold(kind: usize) -> bool {
+    kind == ProofType::Recursive2 as usize || kind == RECORD_KIND_AGGREGATION_WITNESS
+}
+
+fn unix_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
+}
+
+fn start_offset_ms(origin: Instant, at: Instant) -> u32 {
+    at.saturating_duration_since(origin).as_millis() as u32
+}
+
+fn end_offset_ms(origin: Instant, at: Instant) -> u32 {
+    at.saturating_duration_since(origin).as_nanos().div_ceil(1_000_000) as u32
+}
+
+fn section_ms(micros: u64) -> u32 {
+    (micros as f64 / 1000.0).round() as u32
+}
+
+fn merge_sections(slots: &mut [u32; PROOF_TIMING_SECTIONS], breakdown_ms: [u32; PROOF_TIMING_SECTIONS]) {
+    for (slot, ms) in slots.iter_mut().zip(breakdown_ms) {
+        if ms != 0 {
+            *slot = ms;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proofman_common::{BufferPool, TimedBufferPool};
+    use proofman_fields::Goldilocks;
+    use proofman_starks_lib_c::{PROOF_TIMING_LAUNCH_PROLOGUE, PROOF_TIMING_PREPARING_WC, PROOF_TIMING_WITNESS_EXPANSION};
 
     const BASIC: usize = 0;
     const RECURSIVE1: usize = 2;
+
+    struct SlowPool;
+
+    impl BufferPool<Goldilocks> for SlowPool {
+        fn take_buffer(&self) -> Vec<Goldilocks> {
+            std::thread::sleep(Duration::from_millis(5));
+            Vec::new()
+        }
+    }
 
     /// A CPU-backend owner: a null device pointer makes `Drop`'s harvest a no-op, so these tests
     /// exercise the ledger without touching the GPU.
@@ -481,5 +758,174 @@ mod tests {
         drop(first);
         let second = completions.acquire(null);
         assert!(second.epoch() > epoch, "each owner gets a fresh epoch");
+    }
+
+    #[test]
+    fn records_keep_their_order_and_take_empties_the_recorder() {
+        let recorder = ProofRecorder::new();
+        recorder.record_launch(7, BASIC, 0, 1, 3);
+        recorder.record_launch(7, RECURSIVE1, 0, 1, 4);
+        recorder.record_completion(7, RECURSIVE1, [1; PROOF_TIMING_SECTIONS]);
+        recorder.record_completion(7, BASIC, [0; PROOF_TIMING_SECTIONS]);
+
+        let records = recorder.take();
+        let kinds: Vec<usize> = records.iter().map(|r| r.proof_type).collect();
+        assert_eq!(kinds, vec![RECURSIVE1, BASIC], "records keep the order they completed in");
+        let launches: Vec<_> = records.iter().map(|r| (r.id, r.airgroup_id, r.air_id, r.stream_id)).collect();
+        assert_eq!(launches, vec![(7, 0, 1, 4), (7, 0, 1, 3)], "each record keeps the identity of its launch");
+        let breakdowns: Vec<_> = records.iter().map(|r| r.breakdown_ms).collect();
+        assert_eq!(
+            breakdowns,
+            vec![[1; PROOF_TIMING_SECTIONS], [0; PROOF_TIMING_SECTIONS]],
+            "each record keeps the breakdown of its completion"
+        );
+        assert!(records.iter().all(|r| r.start_ms <= r.end_ms), "a span never ends before it starts");
+        assert!(recorder.take().is_empty(), "take drains the recorder");
+    }
+
+    #[test]
+    fn a_record_carries_unix_milliseconds() {
+        let before = unix_ms();
+        let recorder = ProofRecorder::new();
+        recorder.reset();
+        recorder.record_span(0, RECORD_KIND_CHALLENGE, 0, 0, Instant::now());
+        let records = recorder.take();
+        assert!(
+            before <= records[0].start_ms && records[0].end_ms <= unix_ms() + 1,
+            "a record carries the host time in Unix milliseconds"
+        );
+    }
+
+    #[test]
+    fn a_launcher_section_survives_the_completion() {
+        let recorder = ProofRecorder::new();
+        recorder.record_launch(9, RECURSIVE1, 0, 0, 2);
+        let expansion_start = Instant::now();
+        std::thread::sleep(Duration::from_millis(5));
+        recorder.record_section(9, RECURSIVE1, PROOF_TIMING_WITNESS_EXPANSION, expansion_start);
+        recorder.record_section(9, BASIC, PROOF_TIMING_WITNESS_EXPANSION, expansion_start);
+
+        let mut breakdown = [0; PROOF_TIMING_SECTIONS];
+        breakdown[0] = 7;
+        recorder.record_completion(9, RECURSIVE1, breakdown);
+
+        let records = recorder.take();
+        assert_eq!(records.len(), 1, "a section for a proof with no open record is dropped");
+        assert_eq!(records[0].breakdown_ms[0], 7, "the completion fills the sections it reports");
+        assert!(
+            records[0].breakdown_ms[PROOF_TIMING_WITNESS_EXPANSION] >= 5,
+            "the completion's zero does not erase a section the launcher measured"
+        );
+    }
+
+    #[test]
+    fn the_head_of_a_launch_is_measured_from_the_record_it_opened() {
+        let recorder = ProofRecorder::new();
+        recorder.record_launch(4, BASIC, 0, 0, 1);
+        std::thread::sleep(Duration::from_millis(5));
+        recorder.record_launch_section(4, BASIC, PROOF_TIMING_LAUNCH_PROLOGUE, Instant::now());
+        recorder.record_launch_section(4, RECURSIVE1, PROOF_TIMING_LAUNCH_PROLOGUE, Instant::now());
+        recorder.record_completion(4, BASIC, [0; PROOF_TIMING_SECTIONS]);
+
+        let records = recorder.take();
+        assert_eq!(records.len(), 1, "a head for a proof with no open record is dropped");
+        assert!(
+            records[0].breakdown_ms[PROOF_TIMING_LAUNCH_PROLOGUE] >= 5,
+            "the head runs from the launch the record opened, which no callee stamps"
+        );
+    }
+
+    #[test]
+    fn a_drained_completion_closes_at_the_stamp_it_reports() {
+        let recorder = ProofRecorder::new();
+        recorder.record_launch(3, RECORD_KIND_COMMIT, 0, 0, u32::MAX);
+        let harvested_at = Instant::now();
+        std::thread::sleep(Duration::from_millis(20));
+
+        let mut breakdown = [0; PROOF_TIMING_SECTIONS];
+        breakdown[1] = 4;
+        recorder.record_completion_at(3, RECORD_KIND_COMMIT, breakdown, harvested_at);
+
+        let records = recorder.take();
+        assert_eq!(records.len(), 1);
+        assert!(
+            records[0].end_ms < records[0].start_ms + 20,
+            "the record closes when the harvest reported, not when the drain ran"
+        );
+        assert_eq!(records[0].breakdown_ms[1], 4, "the drained completion still fills its sections");
+    }
+
+    #[test]
+    fn a_section_under_a_millisecond_rounds_the_way_the_harvest_rounds() {
+        let recorder = ProofRecorder::new();
+        recorder.record_launch(1, RECORD_KIND_RECOMPUTE, 0, 0, u32::MAX);
+        recorder.record_section_us(1, RECORD_KIND_RECOMPUTE, PROOF_TIMING_PREPARING_WC, 600);
+        recorder.record_completion(1, RECORD_KIND_RECOMPUTE, [0; PROOF_TIMING_SECTIONS]);
+
+        let records = recorder.take();
+        assert_eq!(records[0].breakdown_ms[PROOF_TIMING_PREPARING_WC], 1, "0.6 ms rounds up, as the harvest does");
+    }
+
+    #[test]
+    fn a_span_under_a_millisecond_keeps_one_millisecond() {
+        let origin = Instant::now();
+        let at = origin + Duration::from_micros(1400);
+        assert_eq!(start_offset_ms(origin, at), 1, "the start rounds down");
+        assert_eq!(end_offset_ms(origin, at), 2, "the end rounds up");
+        assert_eq!(end_offset_ms(origin, origin), 0, "an empty span stays empty");
+
+        let recorder = ProofRecorder::new();
+        let start = Instant::now();
+        std::thread::sleep(Duration::from_micros(100));
+        recorder.record_span(0, RECORD_KIND_CHALLENGE, 0, 0, start);
+
+        let records = recorder.take();
+        assert!(records[0].end_ms > records[0].start_ms, "a step of any positive length keeps its bar");
+    }
+
+    #[test]
+    fn the_buffer_pool_stamps_a_take_on_another_thread_and_counts_the_later_waits() {
+        let pool = TimedBufferPool::new(&SlowPool);
+        assert!(pool.acquired_at().is_none(), "no take, no stamp");
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let _ = BufferPool::<Goldilocks>::take_buffer(&pool);
+            });
+        });
+        let acquired = pool.acquired_at().expect("the first take stamps the pool");
+        assert_eq!(pool.later_waited_us(), 0, "the first wait stays outside the record");
+
+        let _ = BufferPool::<Goldilocks>::take_buffer(&pool);
+        assert!(pool.later_waited_us() >= 5_000, "a later wait accumulates");
+        assert_eq!(pool.acquired_at(), Some(acquired), "a later take keeps the stamp");
+    }
+
+    #[test]
+    fn an_import_keeps_the_stamps_and_shifts_the_fold_ids() {
+        let (witness, aggregation, fold) =
+            (RECORD_KIND_WITNESS, RECORD_KIND_AGGREGATION_WITNESS, ProofType::Recursive2 as usize);
+        let primary = ProofRecorder::new();
+        primary.record_span(0, aggregation, 0, 0, Instant::now());
+        primary.record_span(0, fold, 0, 0, Instant::now());
+        std::thread::sleep(Duration::from_millis(20));
+        let secondary = ProofRecorder::new();
+        secondary.record_span(0, aggregation, 0, 0, Instant::now());
+        secondary.record_span(0, fold, 0, 0, Instant::now());
+        secondary.record_span(3, witness, 0, 0, Instant::now());
+        assert!(primary.import(&secondary.export()));
+        primary.record_span(1, fold, 0, 0, Instant::now());
+
+        let records = primary.take();
+        let ids: Vec<_> = records.iter().map(|r| (r.proof_type, r.id)).collect();
+        assert_eq!(ids, [(aggregation, 0), (fold, 0), (aggregation, 1), (fold, 1), (witness, 3), (fold, 2)]);
+        assert!(
+            records[2..5].iter().all(|r| r.start_ms >= records[0].start_ms + 15),
+            "imported records keep their stamps"
+        );
+
+        secondary.next_job();
+        secondary.record_span(0, fold, 0, 0, Instant::now());
+        assert!(!primary.import(&secondary.export()), "a record of another job is rejected");
+        assert!(primary.take().is_empty());
     }
 }
