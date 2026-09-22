@@ -431,6 +431,9 @@ static uint64_t scTreeNumElements(uint64_t nLeaves, uint32_t arity)
     return total + SC_DIGEST; // root
 }
 
+thread_local float streamCommitSectionsMs[3];
+thread_local std::chrono::steady_clock::time_point streamCommitStartedAt;
+
 // blake3 state columns beyond the 8 data columns: the carried CV, plus the
 // parked chunk-0 CV when a row spans two blake3 chunks.
 static uint32_t scBlake3StateCols(uint64_t nCols)
@@ -492,6 +495,24 @@ int64_t streamCommitPacked(gl64_t *slotBase, const StreamCommitDims &dims,
     gl64_t *d_park     = d_cap + (uint64_t)SC_DIGEST * NExt;     // blake3 two-chunk rows only
     uint64_t *d_tree   = (uint64_t *)d_state;                    // valid only after last absorb
 
+    std::vector<cudaEvent_t> sectionEvents;
+    bool timed = true;
+    auto markSection = [&]() {
+        if (!timed) return;
+        cudaEvent_t event;
+        if (cudaEventCreate(&event) != cudaSuccess) {
+            cudaGetLastError();
+            timed = false;
+            return;
+        }
+        sectionEvents.push_back(event);
+        if (cudaEventRecord(event, stream) != cudaSuccess) {
+            cudaGetLastError();
+            timed = false;
+        }
+    };
+    streamCommitStartedAt = std::chrono::steady_clock::now();
+    markSection();
     CHECKCUDAERR(cudaMemcpyAsync(d_widths, colWidths, dims.nCols * 8, cudaMemcpyHostToDevice, stream));
     // Chunked DIRECT copy: the witness pool is host-registered (MemoryHandler),
     // so each block is a plain pinned DMA with no staging memcpy; short blocks
@@ -503,6 +524,7 @@ int64_t streamCommitPacked(gl64_t *slotBase, const StreamCommitDims &dims,
         CHECKCUDAERR(cudaMemcpyAsync((uint8_t *)d_packed + off, (const uint8_t *)hPacked + off, len,
                                      cudaMemcpyHostToDevice, stream));
     }
+    markSection();
 
     NTTGoldilocksGPU ntt;
     const uint32_t ublk = (uint32_t)((N + SC_TPB - 1) / SC_TPB);
@@ -524,6 +546,7 @@ int64_t streamCommitPacked(gl64_t *slotBase, const StreamCommitDims &dims,
                                                              (uint32_t)(k * chunkCols), cc);
         }
         CHECKCUDAERR(cudaGetLastError());
+        markSection();
         // In-place spread: src == dst base (equal-base aliasing path);
         // preserve_src must be false under aliasing.
         ntt.ldeColMajor(d_rate, d_rate, dims.nBits, dims.nBitsExt, cc, stream, false, d_scratch, N);
@@ -534,6 +557,7 @@ int64_t streamCommitPacked(gl64_t *slotBase, const StreamCommitDims &dims,
             scPoseidon1AbsorbChunkKernel<<<ablk, SC_TPB, (size_t)SC_TPB * P16::SPONGE_WIDTH * 8, stream>>>(
                 d_rate, d_cap, cc, k == 0, NExt);
         CHECKCUDAERR(cudaGetLastError());
+        markSection();
     }
 
     scCapToLeavesKernel<<<ablk, SC_TPB, 0, stream>>>(d_cap, d_tree, NExt);
@@ -542,6 +566,26 @@ int64_t streamCommitPacked(gl64_t *slotBase, const StreamCommitDims &dims,
 
     CHECKCUDAERR(cudaMemcpyAsync(hRoot, d_tree + treeElems - SC_DIGEST, SC_DIGEST * 8,
                                  cudaMemcpyDeviceToHost, stream));
+    markSection();
     CHECKCUDAERR(cudaStreamSynchronize(stream));
+    streamCommitSectionsMs[1] = 0;
+    if (timed) {
+        timed = cudaEventElapsedTime(&streamCommitSectionsMs[0], sectionEvents[0], sectionEvents[1]) == cudaSuccess &&
+                cudaEventElapsedTime(&streamCommitSectionsMs[2], sectionEvents[1], sectionEvents.back()) == cudaSuccess;
+        for (uint32_t k = 0; timed && k < nChunks; k++) {
+            float unpackMs;
+            timed = cudaEventElapsedTime(&unpackMs, sectionEvents[1 + 2 * k], sectionEvents[2 + 2 * k]) == cudaSuccess;
+            streamCommitSectionsMs[1] += unpackMs;
+        }
+        if (!timed) cudaGetLastError();
+    }
+    if (timed) {
+        streamCommitSectionsMs[2] -= streamCommitSectionsMs[1];
+    } else {
+        streamCommitSectionsMs[0] = streamCommitSectionsMs[1] = streamCommitSectionsMs[2] = 0;
+    }
+    for (cudaEvent_t event : sectionEvents) {
+        if (cudaEventDestroy(event) != cudaSuccess) cudaGetLastError();
+    }
     return 0;
 }

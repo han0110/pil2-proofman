@@ -537,6 +537,41 @@ impl<F: PrimeField64 + Send + Sync + 'static> BufferPool<F> for MemoryHandler<F>
     }
 }
 
+pub struct TimedBufferPool<'a, F: PrimeField64 + Send + Sync + 'static> {
+    inner: &'a dyn BufferPool<F>,
+    acquired: Mutex<Option<Instant>>,
+    later_waited_us: AtomicU64,
+}
+
+impl<'a, F: PrimeField64 + Send + Sync + 'static> TimedBufferPool<'a, F> {
+    pub fn new(inner: &'a dyn BufferPool<F>) -> Self {
+        Self { inner, acquired: Mutex::new(None), later_waited_us: AtomicU64::new(0) }
+    }
+
+    pub fn acquired_at(&self) -> Option<Instant> {
+        *self.acquired.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    pub fn later_waited_us(&self) -> u64 {
+        self.later_waited_us.load(Ordering::Relaxed)
+    }
+}
+
+impl<F: PrimeField64 + Send + Sync + 'static> BufferPool<F> for TimedBufferPool<'_, F> {
+    fn take_buffer(&self) -> Vec<F> {
+        let start = Instant::now();
+        let buffer = self.inner.take_buffer();
+        let mut acquired = self.acquired.lock().unwrap_or_else(|p| p.into_inner());
+        match *acquired {
+            None => *acquired = Some(Instant::now()),
+            Some(_) => {
+                self.later_waited_us.fetch_add(start.elapsed().as_micros() as u64, Ordering::Relaxed);
+            }
+        }
+        buffer
+    }
+}
+
 /// Buffers for in-flight recursive proofs: one pool per kind of buffer, not per kind of proof.
 ///
 /// A compressor and a recursive proof draw from the same two, each sized at the larger of what the
