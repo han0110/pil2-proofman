@@ -66,7 +66,7 @@ public:
     }
 
     void start(const std::string& name) {
-        if (!on() || capturing()) return;
+        if (capturing()) return;
         if (timers.find(name) == timers.end()) {
             cudaEvent_t start, stop;
             if (!createEvent(start) || !createEvent(stop)) return;
@@ -78,7 +78,7 @@ public:
     }
 
     void stop(const std::string& name) {
-        if (!on() || capturing()) return;
+        if (capturing()) return;
         auto it = timers.find(name);
         if (it == timers.end()) {
 #ifndef __GOLDILOCKS_ENV__
@@ -164,6 +164,7 @@ public:
     }
 
     void syncAndLogAll(std::string instance_id, std::string airgroup_id, std::string air_id) {
+        if (!on()) return;
 #ifndef __GOLDILOCKS_ENV__
         zklog.trace("TIMERS FOR INSTANCE ID " + instance_id + " [" + airgroup_id + ":" + air_id + "]");
         for (const auto& name : order) {

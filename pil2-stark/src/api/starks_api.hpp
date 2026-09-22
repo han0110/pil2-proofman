@@ -238,10 +238,34 @@ extern "C" {
     void *get_unified_buffer_gpu_for_recursivef(void *d_buffers_, void *d_buffers_recursivef_);
     void load_fixed_pols_recursivef(void *pSetupCtx_, void *pConstTree, void *d_buffers_);
     
-    typedef void (*ProofDoneCallback)(uint64_t instanceId, const char* proofType);
+    // Layout and indices must match ProofTiming in bindings_starks.rs.
+    #define PROOF_TIMING_SECTIONS 27
+    #define PROOF_TIMING_GPU_SECTIONS 14
+    #define PROOF_TIMING_TRACE_UPLOAD 9
+    #define PROOF_TIMING_TRACE_UNPACK 12
+    #define PROOF_TIMING_COMMIT_LDE_MERKLE 13
+    #define PROOF_TIMING_PROOF_WRITE 14
+    #define PROOF_TIMING_STREAM_WAIT 16
+    #define PROOF_TIMING_ROOT_READBACK 17
+    #define PROOF_TIMING_HARVEST_WAIT 22
+    #define PROOF_TIMING_FFI_PROLOGUE 24
+    #define PROOF_TIMING_PUBLICS_STAGING 25
+    #define PROOF_TIMING_GPU_ENQUEUE_GAP 26
+    struct ProofTiming {
+        double sections[PROOF_TIMING_SECTIONS];
+        uint32_t streamId;
+    };
+
+    typedef void (*ProofDoneCallback)(uint64_t instanceId, const char* proofType, const struct ProofTiming* timing);
     
     void register_proof_done_callback(ProofDoneCallback cb);
     void launch_callback(uint64_t instanceId, char *proofType);
+
+    typedef void (*CommitDoneCallback)(uint64_t instanceId, const struct ProofTiming* timing);
+
+    void register_commit_done_callback(CommitDoneCallback cb);
+
+    void get_last_proof_timing(uint64_t streamId, struct ProofTiming* timing);
 
     // Backend selection
     // =================================================================================

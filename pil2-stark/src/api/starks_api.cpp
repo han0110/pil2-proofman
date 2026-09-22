@@ -37,6 +37,9 @@ using json = nlohmann::json;
 using namespace CPlusPlusLogging;
 
 ProofDoneCallback proof_done_callback = nullptr;
+CommitDoneCallback commit_done_callback = nullptr;
+ProofTiming last_proof_timing = {};
+thread_local ProofTiming last_slot_commit_timing = {};
 #ifdef __USE_MPI_RMA__
 MPI_Win win;
 int win_buff = -1;
@@ -962,7 +965,7 @@ void *gen_recursive_proof_final_cpu(void *pSetupCtx, uint64_t airgroupId, uint64
 
 void launch_callback(uint64_t instanceId, char *proofType) {
     if (proof_done_callback != nullptr) {
-        proof_done_callback(instanceId, proofType);
+        proof_done_callback(instanceId, proofType, nullptr);
     }
 }
 
@@ -1256,6 +1259,18 @@ uint64_t goldilocks_inv_ffi(const uint64_t *in1) {
 
 void register_proof_done_callback(ProofDoneCallback cb) {
     proof_done_callback = cb;
+}
+
+void register_commit_done_callback(CommitDoneCallback cb) {
+    commit_done_callback = cb;
+}
+
+void get_last_proof_timing(uint64_t streamId, ProofTiming *timing) {
+    if (streamId == UINT64_MAX) {
+        *timing = last_slot_commit_timing;
+        return;
+    }
+    *timing = last_proof_timing.streamId == (uint32_t)streamId ? last_proof_timing : ProofTiming{};
 }
 
 int build_const_tree_c(

@@ -449,6 +449,7 @@ struct StreamData{
     // trace H2D. Distinct from end_event (the whole commit): the buffer can be recycled as soon
     // as the copy is done, and gating that on the LDE/Merkle work kept the pool starved.
     cudaEvent_t trace_copy_event;
+    cudaEvent_t harvest_event;
     // One timer per ring slot: the next proof is enqueued while the current one still runs,
     // so it must record into its own object. launchSeq advances only at ring pushes, so
     // outside the pipeline every path shares timers[0].
@@ -476,6 +477,9 @@ struct StreamData{
     int64_t instanceId;
     string proofType;
     uint64_t arity;
+    uint64_t streamWaitUs = 0;
+    uint64_t ffiPrologueUs = 0;
+    double harvestWaitMs = 0.0;
 
     // Which fixed columns this stream's aux trace holds, not which air it last served: airs
     // with identical fixed share a const-pols slot, so the offset is the key. constAggBuffer
@@ -520,6 +524,8 @@ struct StreamData{
         Goldilocks::Element *pinnedProof = nullptr;
         cudaEvent_t done = nullptr;
         TimerGPU *timer = nullptr;   // closed (synced + logged) by the harvester
+        uint64_t streamWaitUs = 0;
+        uint64_t ffiPrologueUs = 0;
     };
     PipelineSlot pipeSlots[2];
     uint32_t pipeHead = 0;
@@ -554,6 +560,7 @@ struct StreamData{
         recursive = recursive_;
         cudaEventCreate(&end_event);
         cudaEventCreate(&trace_copy_event);
+        cudaEventCreate(&harvest_event);
         instanceId = -1;
         status = 0;
         // x2: parity slots for the deep pipeline (slot 0 is the only one used
@@ -613,6 +620,9 @@ struct StreamData{
         root = nullptr;
         pSetupCtx = nullptr;
         proofBuffer = nullptr;
+        streamWaitUs = 0;
+        ffiPrologueUs = 0;
+        harvestWaitMs = 0.0;
 
         // Clear stale open timer categories: a cancel mid-category leaves one open, and the next
         // job's stopCategory then mismatches and CHECKCUDAERR-aborts. Host-side only, no CUDA calls.
@@ -672,6 +682,7 @@ struct StreamData{
         cudaEventDestroy(fixedTreeDone);
         cudaEventDestroy(end_event);
         cudaEventDestroy(trace_copy_event);
+        cudaEventDestroy(harvest_event);
         cudaFreeHost(pinned_buffer_proof);
         cudaFreeHost(pinned_buffer_exps_params);
         cudaFreeHost(pinned_buffer_exps_args);

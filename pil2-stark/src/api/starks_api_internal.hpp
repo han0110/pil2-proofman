@@ -38,6 +38,9 @@ inline void runGrindingPermute(Goldilocks::Element (&out)[8],
 }
 
 extern ProofDoneCallback proof_done_callback;
+extern CommitDoneCallback commit_done_callback;
+extern ProofTiming last_proof_timing;
+extern thread_local ProofTiming last_slot_commit_timing;
 
 struct PackedInfoCPU {
     bool is_packed;

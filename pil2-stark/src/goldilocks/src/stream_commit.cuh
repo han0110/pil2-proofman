@@ -3,6 +3,7 @@
 
 #include <cuda_runtime.h>
 #include <cstdint>
+#include <chrono>
 
 class gl64_t;
 
@@ -76,6 +77,9 @@ struct StreamCommitDims {
 //                              8 + 4 state) or 16 (blake3, nCols > 128: 8 + 4
 //                              state + 4 parked chunk-0 CV)
 //   [.., +N)                   LDE scratch
+extern thread_local float streamCommitSectionsMs[3];
+extern thread_local std::chrono::steady_clock::time_point streamCommitStartedAt;
+
 uint64_t streamCommitSlotElems(const StreamCommitDims &dims,
                                StreamCommitHash hash = StreamCommitHash::Poseidon1);
 

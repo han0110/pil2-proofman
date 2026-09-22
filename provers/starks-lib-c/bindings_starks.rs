@@ -783,6 +783,10 @@ extern "C" {
     
     pub fn launch_callback(instanceId: u64, proofType: *mut ::std::os::raw::c_char);
 
+    pub fn register_commit_done_callback(cb: CommitDoneCallback);
+
+    pub fn get_last_proof_timing(streamId: u64, timing: *mut ProofTiming);
+
     // MPI calls
     // ========================================================================================
     pub fn initialize_agg_readiness_tracker();
@@ -793,4 +797,50 @@ extern "C" {
 
 // Type definitions
 pub type ProofDoneCallback =
-    ::std::option::Option<unsafe extern "C" fn(instanceId: u64, proofType: *const ::std::os::raw::c_char)>;
+    ::std::option::Option<unsafe extern "C" fn(instanceId: u64, proofType: *const ::std::os::raw::c_char, timing: *const ProofTiming)>;
+
+pub const PROOF_TIMING_SECTIONS: usize = 27;
+pub const PROOF_TIMING_WITNESS_EXPANSION: usize = 15;
+pub const PROOF_TIMING_CIRCOM_WITNESS: usize = 18;
+pub const PROOF_TIMING_PREPARING_WC: usize = 19;
+pub const PROOF_TIMING_COMPUTING_WC: usize = 20;
+pub const PROOF_TIMING_RELOAD_FIXED_POLS: usize = 21;
+pub const PROOF_TIMING_LAUNCH_PROLOGUE: usize = 23;
+
+#[repr(C)]
+pub struct ProofTiming {
+    pub sections: [f64; PROOF_TIMING_SECTIONS],
+    pub streamId: u32,
+}
+
+pub const PROOF_TIMING_SECTION_NAMES: [&str; PROOF_TIMING_SECTIONS] = [
+    "Prepare Trace",
+    "Commit Stage 1",
+    "Calculate Accumulation Polynomials",
+    "Calculate Intermediate Polynomials",
+    "Commit Stage 2",
+    "Quotient",
+    "Evaluations",
+    "FRI",
+    "Load Custom Commits",
+    "Trace Upload",
+    "Load Const Tree",
+    "Proof Readback",
+    "Trace Unpack",
+    "Compute LDE and Merkle",
+    "Proof Write",
+    "Witness Expansion",
+    "Stream Wait",
+    "Root Readback",
+    "Circom Witness",
+    "Prepare Witness Generation",
+    "Witness Generation",
+    "Reload Fixed Pols",
+    "Harvest Wait",
+    "Launch Prologue",
+    "FFI Prologue",
+    "Publics Staging",
+    "GPU Enqueue Gap",
+];
+
+pub type CommitDoneCallback = ::std::option::Option<unsafe extern "C" fn(instanceId: u64, timing: *const ProofTiming)>;
