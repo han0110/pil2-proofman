@@ -193,7 +193,7 @@ use std::ffi::c_void;
 
 use proofman_util::{
     timer_start_info, timer_stop_and_log_info, timer_start_debug, timer_stop_and_log_debug,
-    timer_stop_and_log_debug_net, create_buffer_fast,
+    timer_stop_and_log_debug_net, create_buffer_fast, timer_start_trace, timer_stop_and_log_trace,
 };
 
 use serde::Serialize;
@@ -3362,6 +3362,7 @@ where
         phase: ProvePhase,
     ) -> ProofmanResult<ProvePhaseResult> {
         let _computing = self.acquire_computing("_generate_proof");
+        let _timeline = crate::timeline::FinishOnDrop(&self.mpi_ctx, &self.cancellation_info);
 
         // The witness components' `end` runs on every exit of the proving path, success or error,
         // as it does on the constraint-check paths: a component that still holds something for
@@ -3392,6 +3393,7 @@ where
                 ));
             }
 
+            crate::timeline::start_job();
             self.cancellation_info.write_recover().reset();
             // Collective: whether a short buffer pool fails the job depends on each rank's own
             // `cancelled` flag, so ranks can disagree and the ones that go on hang in the next MPI
@@ -4137,6 +4139,7 @@ where
                             let id = rec2.len();
                             rec2.push(None);
                             witness.global_idx = Some(id);
+                            crate::timeline::mark_fold(id, &witness.trace);
                             id as u64
                         } else {
                             witness.global_idx.unwrap() as u64
@@ -5367,6 +5370,7 @@ where
                 };
 
                 witness.global_idx = Some(id);
+                crate::timeline::mark_fold(id, &witness.trace);
 
                 let mut new_proof = match gen_recursive_proof_size(&pctx_clone, &setups_clone, &witness) {
                     Ok(p) => p,
@@ -5564,6 +5568,7 @@ where
                     };
 
                     witness.global_idx = Some(id);
+                    crate::timeline::mark_fold(id, &witness.trace);
 
                     let mut new_proof = match gen_recursive_proof_size(&pctx_clone, &setups_clone, &witness) {
                         Ok(p) => p,
@@ -5924,6 +5929,7 @@ where
                     if stage_first {
                         pctx_clone.dispatch_deferred[instance_id].store(true, Ordering::SeqCst);
                     }
+                    timer_start_trace!(COMPUTING_WC, "COMPUTING_WC_{instance_id} [{airgroup_id}:{air_id}]");
                     let computed = match wcm.calculate_witness(
                         1,
                         &[instance_id],
@@ -5936,6 +5942,7 @@ where
                             false
                         }
                     };
+                    timer_stop_and_log_trace!(COMPUTING_WC, "COMPUTING_WC_{instance_id} [{airgroup_id}:{air_id}]");
                     // The staging below is an H2D wait, not CPU work: give the tokens and the
                     // admission slot back first so the next witness can start.
                     drop(tokens);
@@ -5944,6 +5951,7 @@ where
                     let (slot, wake) = if stage_first {
                         let wake = slot.wake.clone();
                         drop(slot);
+                        timer_start_trace!(STAGING_WC, "STAGING_WC_{instance_id} [{airgroup_id}:{air_id}]");
                         // Only a witness computed in full has a trace to upload, and a cancelled job commits
                         // nothing: a failed witness can leave its instance a trace pointer to no live
                         // buffer, and copying from it ended the process (SIGSEGV in the H2D copy).
@@ -5959,6 +5967,7 @@ where
                                 Err(e) => cancellation_info_clone.write_recover().cancel(Some(e)),
                             }
                         }
+                        timer_stop_and_log_trace!(STAGING_WC, "STAGING_WC_{instance_id} [{airgroup_id}:{air_id}]");
                         pctx_clone.end_deferred_dispatch(instance_id);
                         (None, Some(wake))
                     } else {
@@ -6782,6 +6791,7 @@ where
             order.sort_by_key(|&g| ctx.load_bytes[g].load(Ordering::Relaxed));
             order.into_iter().find_map(|g| ctx.pools[g].1.try_recv().ok().map(|slot| (g, slot)))
         };
+        timer_start_trace!(WAITING_FOR_SLOT);
         let free = if staged_gpu.is_none() { least_loaded_free() } else { None };
         let (pool, slot) = match (staged_gpu, free) {
             (Some(g), _) => (g, ctx.pools[g].1.recv_timeout(timeout).ok()),
@@ -6800,6 +6810,7 @@ where
                 }
             }
         };
+        timer_stop_and_log_trace!(WAITING_FOR_SLOT);
         let Some(slot) = slot else {
             dump_pipeline_state_c(pctx.get_device_buffers_ptr());
             return Err(ProofmanError::ProofmanError(format!(

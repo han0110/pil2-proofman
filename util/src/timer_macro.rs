@@ -33,6 +33,7 @@ macro_rules! timer_start_info {
 #[macro_export]
 macro_rules! timer_stop_and_log_info {
     ($name:ident) => {
+        $crate::timeline::record(|| stringify!($name), $name);
         #[allow(non_snake_case)]
         let $name = std::time::Instant::now() - $name;
         let is_terminal = std::io::IsTerminal::is_terminal(&std::io::stdout()) && std::env::var("NO_COLOR").is_err();
@@ -47,6 +48,7 @@ macro_rules! timer_stop_and_log_info {
         tracing::info!("{}<<< {} ({}ms){}", escape_in, stringify!($name), $name.as_millis(), escape_out);
     };
     ($name:ident, $($arg:tt)+) => {
+        $crate::timeline::record(|| format!($($arg)+), $name);
         #[allow(non_snake_case)]
         let $name = std::time::Instant::now() - $name;
         let is_terminal = std::io::IsTerminal::is_terminal(&std::io::stdout()) && std::env::var("NO_COLOR").is_err();
@@ -97,6 +99,7 @@ macro_rules! timer_start_debug {
 #[macro_export]
 macro_rules! timer_stop_and_log_debug {
     ($name:ident) => {
+        $crate::timeline::record(|| stringify!($name), $name);
         #[allow(non_snake_case)]
         let $name = std::time::Instant::now() - $name;
         let is_terminal = std::io::IsTerminal::is_terminal(&std::io::stdout()) && std::env::var("NO_COLOR").is_err();
@@ -111,6 +114,7 @@ macro_rules! timer_stop_and_log_debug {
         tracing::debug!("{}<<< {} ({}ms){}", escape_in, stringify!($name), $name.as_millis(), escape_out);
     };
     ($name:ident, $($arg:tt)+) => {
+        $crate::timeline::record(|| format!($($arg)+), $name);
         #[allow(non_snake_case)]
         let $name = std::time::Instant::now() - $name;
         let is_terminal = std::io::IsTerminal::is_terminal(&std::io::stdout()) && std::env::var("NO_COLOR").is_err();
@@ -161,6 +165,7 @@ macro_rules! timer_start_trace {
 #[macro_export]
 macro_rules! timer_stop_and_log_trace {
     ($name:ident) => {
+        $crate::timeline::record(|| stringify!($name), $name);
         #[allow(non_snake_case)]
         let $name = std::time::Instant::now() - $name;
         let is_terminal = std::io::IsTerminal::is_terminal(&std::io::stdout()) && std::env::var("NO_COLOR").is_err();
@@ -175,6 +180,7 @@ macro_rules! timer_stop_and_log_trace {
         tracing::trace!("{}<<< {} ({}ms){}", escape_in, stringify!($name), $name.as_millis(), escape_out);
     };
     ($name:ident, $($arg:tt)+) => {
+        $crate::timeline::record(|| format!($($arg)+), $name);
         #[allow(non_snake_case)]
         let $name = std::time::Instant::now() - $name;
         let is_terminal = std::io::IsTerminal::is_terminal(&std::io::stdout()) && std::env::var("NO_COLOR").is_err();
@@ -195,6 +201,7 @@ macro_rules! timer_stop_and_log_trace {
 #[macro_export]
 macro_rules! timer_stop_and_log_debug_net {
     ($name:ident, $waited:expr, $($arg:tt)+) => {
+        $crate::timeline::record(|| format!($($arg)+), $name);
         #[allow(non_snake_case)]
         let $name = std::time::Instant::now() - $name;
         let waited: std::time::Duration = $waited;

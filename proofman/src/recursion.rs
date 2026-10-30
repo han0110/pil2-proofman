@@ -462,6 +462,7 @@ pub fn gen_witness_aggregation<F: PrimeField64>(
         memory_handler_recursive_witness.agg_witness_threads(),
     )?;
 
+    crate::timeline::mark_witness_buffer(airgroup_id, &trace);
     timer_stop_and_log_debug_net!(
         GENERATE_WITNESS_AGGREGATION,
         proofman_common::take_buffer_wait(trace.as_ptr() as *const u8),

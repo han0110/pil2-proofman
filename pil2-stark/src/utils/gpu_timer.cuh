@@ -10,6 +10,7 @@
 #include <mutex>
 #ifndef __GOLDILOCKS_ENV__
 #include "zklog.hpp"
+#include "timeline.hpp"
 #endif
 
 #define LOG_TIME_GPU 1
@@ -107,7 +108,7 @@ public:
 #ifdef __GOLDILOCKS_ENV__
         return true;
 #else
-        return CPlusPlusLogging::Logger::getInstance(CPlusPlusLogging::LOG_TYPE::CONSOLE)->getLogLevel() == CPlusPlusLogging::LOG_LEVEL_TRACE;
+        return timeline_recording() || CPlusPlusLogging::Logger::getInstance(CPlusPlusLogging::LOG_TYPE::CONSOLE)->getLogLevel() == CPlusPlusLogging::LOG_LEVEL_TRACE;
 #endif
     }
 

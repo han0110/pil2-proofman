@@ -1,4 +1,5 @@
 pub mod cli;
+pub mod timeline;
 pub mod timer_macro;
 use std::ffi::c_void;
 

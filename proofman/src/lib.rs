@@ -9,6 +9,7 @@ mod verify;
 mod challenge_accumulation;
 mod snark_wrapper;
 mod pilfflonk_wrap;
+mod timeline;
 
 pub use scheduler::*;
 pub use compressed_proof::*;
@@ -19,3 +20,4 @@ pub use proof_manager::*;
 pub use verify_constraints::*;
 pub use verify::*;
 pub use snark_wrapper::*;
+pub use timeline::*;

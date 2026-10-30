@@ -33,6 +33,7 @@ extern uint64_t getFinalSnarkProtocolIdGPU(void *snark_prover);
 #ifdef __USE_CUDA__
 #include "verify_constraints.cuh"
 #include "gen_proof.cuh"
+#include "timeline_gpu.cuh"
 #include "poseidon_goldilocks.cuh"
 #include "poseidon2_goldilocks.cuh"
 #include "blake3_goldilocks.cuh"
@@ -2116,6 +2117,7 @@ void get_proof(DeviceCommitBuffers *d_buffers, uint64_t streamId) {
     string proofFile = d_buffers->streamsData[streamId].proofFile;
     TimerGPU &timer = d_buffers->streamsData[streamId].curTimer();
 
+    timelineExport(timer, proofType.c_str(), instanceId, airgroupId, airId);
     closeStreamTimer(timer, instanceId, airgroupId, airId, true);
 
     writeProof(*setupCtx, d_buffers->streamsData[streamId].pinned_buffer_proof, proofBuffer, airgroupId, airId, instanceId, proofFile);
@@ -2171,6 +2173,7 @@ static void harvestPipelineStream(DeviceCommitBuffers *d_buffers, uint64_t strea
             return;
         }
         // Every event of this proof precedes `done` on the stream, so the syncs inside are immediate.
+        timelineExport(*ps->timer, ps->proofType.c_str(), (uint64_t)ps->instanceId, ps->airgroupId, ps->airId);
         closeStreamTimer(*ps->timer, (uint64_t)ps->instanceId, ps->airgroupId, ps->airId, true);
         SetupCtx *setupCtx = (SetupCtx *)ps->pSetupCtx;
         writeProof(*setupCtx, ps->pinnedProof, ps->proofBuffer, ps->airgroupId, ps->airId,
@@ -2474,6 +2477,7 @@ uint64_t gen_recursive_proof_gpu(void *pSetupCtx_, uint64_t airgroupId, uint64_t
                        air_instance_info->gate_band_family,
                        sd.d_gate_band_scratch, stream);
     TimerStopGPU(timer, STARK_GPU_WITNESS);
+    TimerStartGPU(timer, STARK_STAGE_PUBLICS);
     
     uint64_t offsetPublicInputs = setupCtx->starkInfo.mapOffsets[std::make_pair("publics", false)];
     // Stage publics into the per-stream pinned region for an async copy (no stream
@@ -2495,6 +2499,7 @@ uint64_t gen_recursive_proof_gpu(void *pSetupCtx_, uint64_t airgroupId, uint64_t
 
     // See gen_proof_gpu: the tree-aware flag, not the slot one.
     if (fixedPrebuilt) CHECKCUDAERR(cudaStreamWaitEvent(stream, sd.fixedPolsDone, 0));
+    TimerStopGPU(timer, STARK_STAGE_PUBLICS);
     genProof_gpu(*setupCtx, d_aux_trace, d_const_pols, d_const_tree, streamId, instanceId, d_buffers, air_instance_info, timer, stream, true, reuse_const_tree || fixedPrebuilt, fixedPrebuilt);
     if (constSlot >= 0) releaseConstSlot(d_buffers, gpuLocalId, constSlot, stream);
     if (d_buffers->pipelineMode && !sd.recursive) {
@@ -3635,7 +3640,10 @@ int64_t commit_witness_streaming_gpu(void *d_buffers_, uint64_t slotIdx,
     // zone staging freed, a released host buffer gone), so the commit must not refuse after it.
     if (const int64_t rc = streamCommitCheck(dims, dColSource, dColLane, dTable, scHash); rc != 0) return rc;
     uint32_t slotGen = 0;
+    const int64_t enterStart = timelineHostStart();
     if (const int enterRc = streamCommitEnter(d_buffers, gl, &slotGen); enterRc != 0) return enterRc;
+    timelineHostStop("STREAM_COMMIT_ENTER", enterStart, nullptr, instanceId, airgroupId, airId);
+    const int64_t prepareStart = timelineHostStart();
     // Every return below must drain the slot's stream first: once released, legacy streams may write the slot.
     auto releaseRegion = [&] {
         const cudaError_t drain = cudaStreamSynchronize(d_buffers->streamCommitStreams[slotIdx]);
@@ -3985,6 +3993,7 @@ int64_t commit_witness_streaming_gpu(void *d_buffers_, uint64_t slotIdx,
     // An air that scatters nothing holds no count back (a failed commit is fatal, see the caller).
     if (slotCtx.mul == nullptr) mul_note_commit();
 
+    timelineHostStop("STREAM_COMMIT_PREPARE", prepareStart, nullptr, instanceId, airgroupId, airId);
     TimerStartGPU(timer, STARK_GPU_COMMIT);
     memcpy(hWidths, colWidths, nCols * sizeof(uint64_t));
     int64_t rc = streamCommitPacked(slotBase, dims, hWidths, packedSrc,
@@ -3995,8 +4004,13 @@ int64_t commit_witness_streaming_gpu(void *d_buffers_, uint64_t slotIdx,
                                     slotElems);
     TimerStopGPU(timer, STARK_GPU_COMMIT);
     if (rc == 0) memcpy(root, hRoot, STREAM_COMMIT_HOST_ROOT_WORDS * sizeof(uint64_t));
+    const int64_t exportStart = timelineHostStart();
+    timelineExport(timer, nullptr, instanceId, airgroupId, airId);
+    timelineHostStop("TIMELINE_EXPORT", exportStart, nullptr, instanceId, airgroupId, airId);
+    const int64_t closeStart = timelineHostStart();
     closeStreamTimer(timer, instanceId, airgroupId, airId, false);
     releaseRegion();
+    timelineHostStop("STREAM_COMMIT_CLOSE", closeStart, nullptr, instanceId, airgroupId, airId);
     return rc;
 }
 
